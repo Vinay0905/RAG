@@ -6,9 +6,10 @@ Welcome to Phase 2. In this guide, we adapt Qdrant to index our sentence-aligned
 We will learn how to:
 1. **Connect to Qdrant** (Docker container or local memory).
 2. **Configure a Hybrid Search Collection** (Dense semantic vectors + Sparse BM25 keyword indices).
-3. **Use FastEmbed** to vectorize our chunk text.
-4. **Insert data and payloads** directly.
-5. **Run test queries** evaluating Dense, Sparse, and Hybrid searches.
+3. **Setup Payload Indexes** to enable fast metadata filtering on publication date and document section.
+4. **Use FastEmbed** to vectorize our chunk text.
+5. **Insert data and payloads** directly.
+6. **Run test queries** evaluating Dense, Sparse, and Hybrid searches.
 
 ---
 
@@ -16,7 +17,7 @@ We will learn how to:
 
 Create `02_qdrant_indexing.ipynb` in the `notesbooks/` directory and add the following cells:
 
-### Cell 1: imports and Qdrant Setup
+### Cell 1: Imports and Qdrant Setup
 ```python
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, SparseVectorParams, SparseIndexParams
@@ -52,6 +53,31 @@ client.recreate_collection(
 )
 
 print(f"Collection '{COLLECTION_NAME}' created and configured successfully for Hybrid Search!")
+```
+
+### Cell 2.5: Setting up Payload Indexes (New)
+To allow our LangGraph agent to filter papers instantly by section (e.g., only "Methods") or by date, we create payload indexes on these fields:
+
+```python
+from qdrant_client.models import PayloadSchemaType
+
+print("Creating payload indexes for metadata filtering...")
+
+# Index the 'date' field (Keyword index for fast comparison / filtering)
+client.create_payload_index(
+    collection_name=COLLECTION_NAME,
+    field_name="date",
+    field_schema=PayloadSchemaType.KEYWORD
+)
+
+# Index the 'section' field (Keyword index)
+client.create_payload_index(
+    collection_name=COLLECTION_NAME,
+    field_name="section",
+    field_schema=PayloadSchemaType.KEYWORD
+)
+
+print("Payload indexes established successfully!")
 ```
 
 ### Cell 3: Loading FastEmbed Models

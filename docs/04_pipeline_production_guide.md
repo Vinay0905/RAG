@@ -132,8 +132,7 @@ import uuid
 import tiktoken
 from tqdm import tqdm
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, VectorParams, SparseVectorParams, SparseIndexParams, PointStruct, SparseVector
-from fastembed import TextEmbedding, SparseTextEmbedding
+from qdrant_client.models import Distance, VectorParams, SparseVectorParams, SparseIndexParams, PointStruct, SparseVector, PayloadSchemaType
 import config
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -147,6 +146,7 @@ class IngestionPipeline:
         
     def setup_collection(self):
         print(f"Setting up Qdrant collection: {config.COLLECTION_NAME}")
+        # Create base collection with Dual-Vector Indexes
         self.client.recreate_collection(
             collection_name=config.COLLECTION_NAME,
             vectors_config={
@@ -155,6 +155,19 @@ class IngestionPipeline:
             sparse_vectors_config={
                 "sparse-bm25": SparseVectorParams(index=SparseIndexParams(on_disk=True))
             }
+        )
+        
+        # Create Payload Indexes for fast metadata filtering
+        print("Registering metadata payload indexes...")
+        self.client.create_payload_index(
+            collection_name=config.COLLECTION_NAME,
+            field_name="date",
+            field_schema=PayloadSchemaType.KEYWORD
+        )
+        self.client.create_payload_index(
+            collection_name=config.COLLECTION_NAME,
+            field_name="section",
+            field_schema=PayloadSchemaType.KEYWORD
         )
 
     def split_recursive_sentence(self, text: str) -> list:
@@ -342,7 +355,6 @@ import json
 from groq import Groq
 from qdrant_client import QdrantClient
 from qdrant_client.models import SparseVector
-from fastembed import TextEmbedding, SparseTextEmbedding
 from langgraph.graph import StateGraph, END
 
 import config
