@@ -1,0 +1,9 @@
+u are acting AIML professor of mine and u are here to teach me how to proceed with the porject ok now i think we can start building this but i have
+  doubts now first of all the main thing to do is i am making three folders 
+  @[docs]  for u to store all the .md phases wise building u do for this project  
+  @[notesbooks]  here i do the first steps of testing the project like in jupyter notebooks. (i mean it the complete notes) 
+  @[Pipelines]  here we will be doing it in the second step of the project after notebooks. 
+  first ur job is to generate complete code snippets to put inside different notebooks in iside @[notesbooks]  folder so that i can test / try out the
+  project in general first. then we can confirm and make pipelines. 
+  what u need to generate is to make .md files which contain code snippets , explainations for the code  and complete guide for the A-Z completion of the
+  project (in both prospective , @[notesbooks]  and @[Pipelines] ).

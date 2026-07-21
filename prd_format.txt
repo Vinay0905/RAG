@@ -1,0 +1,50 @@
+Title and summary.
+
+Problem statement or objective.
+
+Target users / personas.
+
+Requirements or features.
+
+User flows or use cases.
+
+Non-functional requirements, like performance or security.
+
+Out of scope items.
+
+Assumptions, risks, and dependencies.
+
+Success metrics.
+
+Timeline or milestones.
+
+Simple PRD template
+What are we building?
+
+Why are we building it?
+
+Who is it for?
+
+What should it do?
+
+What is not included?
+
+How will we know it worked?
+
+When will it ship?
+
+Short example
+Title: Mobile Login Redesign.
+
+Goal: Reduce login drop-offs.
+
+Users: Existing app users.
+
+Requirements: Email login, OTP login, forgot password.
+
+Out of scope: Social login.
+
+Success metric: 20% fewer failed login attempts.
+
+Milestone: Design, development, QA, release.
+
