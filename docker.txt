@@ -1,0 +1,31 @@
+Run these commands in your terminal to stop and remove any active or stopped Qdrant instances (this avoids name/port conflicts):                                                                 
+                                                                                                                                                                                                   
+    # Stop any container running Qdrant                                                                                                                                                            
+    docker stop $(docker ps -q --filter ancestor=qdrant/qdrant)                                                                                                                                    
+                                                                                                                                                                                                   
+    # Remove the stopped Qdrant containers                                                                                                                                                         
+    docker rm $(docker ps -a -q --filter ancestor=qdrant/qdrant)                                                                                                                                   
+                                                                                                                                                                                                   
+  (If the command above says "requires at least 1 argument", it means there were no containers to stop/remove, which is fine).                                                                     
+  ──────                                                                                                                                                                                           
+  ### Step 2: Start Qdrant with Explicit IPv4 Loopback Bindings                                                                                                                                    
+                                                                                                                                                                                                   
+  Run this command to start Qdrant. By prefixing the ports with 127.0.0.1:, we force Docker to route requests through the IPv4 loopback interface directly, preventing macOS IPv6 resolution bugs: 
+                                                                                                                                                                                                   
+    docker run -d -p 127.0.0.1:6333:6333 -p 127.0.0.1:6334:6334 --name qdrant qdrant/qdrant                                                                                                        
+    ──────                                                                                                                                                                                         
+  ### Step 3: Run the Test Client                                                                                                                                                                  
+                                                                                                                                                                                                   
+  I have written the test script into your client.py file. Run it in your terminal (with your environment active):                                                                                 
+                                                                                                                                                                                                   
+    python client.py                                                                                                                                                                               
+                                                                                                                                                                                                   
+  If it connects successfully, you should see the following output:                                                                                                                                
+                                                                                                                                                                                                   
+    Attempting to connect to local Qdrant container...                                                                                                                                             
+    🎉 SUCCESS: Connected to Qdrant Docker on http://127.0.0.1:6333!                                                                                                                               
+                                                                                                                                                                                                   
+    Setting up collection 'cuad_advanced'...                                                                                                                                                       
+    🎉 SUCCESS: Collection 'cuad_advanced' is active and ready!                                                                                                                                    
+    
+
