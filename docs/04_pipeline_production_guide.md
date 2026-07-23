@@ -1,9 +1,9 @@
-# Phase 4: Production Pipeline Packaging Guide (Updated)
+# Phase 4: Production Pipeline Packaging Guide
 **Target Location**: `Pipelines/`
 
 Once you have successfully executed the notebooks in your `notesbooks/` directory and are satisfied with the retrieval performance, we move the code into production scripts.
 
-We will organize the codebase inside the `Pipelines/` folder. This set of production scripts accesses the local CORD-19 data from your `dataset/` folder and indexes it using **Recursive Sentence-Aligned Chunking**.
+We will organize the codebase inside the `Pipelines/` folder. This set of production scripts accesses the local CUAD contract data from your `dataset/` folder and indexes it using **Recursive Sentence-Aligned Chunking**.
 
 ---
 
@@ -39,7 +39,7 @@ DATASET_PATH = os.getenv("DATASET_PATH", "/Users/mast/Documents/VInayPrograming/
 
 # Qdrant Configs
 QDRANT_HOST = os.getenv("QDRANT_HOST", "http://localhost:6333")
-COLLECTION_NAME = "cord19_advanced"
+COLLECTION_NAME = "cuad_advanced"
 
 # Models Configs
 DENSE_MODEL_NAME = "BAAI/bge-small-en-v1.5"
@@ -60,13 +60,13 @@ MAX_RETRIES = 2
 
 ### File 2: `Pipelines/prompts.py`
 ```python
-QUERY_EXPANSION_PROMPT = """You are a scientific research search assistant.
-Generate exactly 3 variations of the following search query to help retrieve scientific papers from a vector database.
+QUERY_EXPANSION_PROMPT = """You are a legal research search assistant.
+Generate exactly 3 variations of the following search query to help retrieve relevant clauses (such as termination, indemnity, limitation of liability) from a legal contract vector database.
 Generate ONLY the 3 queries, one per line. Do not number them or add any introductory text.
 
 Original Query: {query}"""
 
-GENERATION_PROMPT = """You are an expert scientific researcher. Answer the query based ONLY on the provided sources below.
+GENERATION_PROMPT = """You are an expert corporate lawyer. Answer the query based ONLY on the provided contract sources below.
 Use inline citations when stating facts (e.g. "Fact [SOURCE 1]").
 If the context does not contain enough information to answer the query, reply with: 'INSUFFICIENT_CONTEXT'
 
@@ -76,7 +76,7 @@ Sources:
 {contexts}
 """
 
-GRADER_PROMPT = """Analyze if the Candidate Response is fully grounded and supported by the Reference Context.
+GRADER_PROMPT = """Analyze if the Candidate Response is fully grounded and supported by the Reference Context (legal contracts).
 Also check if it directly answers the User Query.
 Respond in exactly this JSON format:
 {{
@@ -89,8 +89,8 @@ User Query: {query}
 Reference Context: {context}
 Candidate Response: {response}"""
 
-QUERY_REWRITE_PROMPT = """The previous search query '{query}' did not retrieve enough information to answer the research topic.
-Rewrite this query to be broader, using clinical synonyms or different search angles to retrieve relevant scientific results.
+QUERY_REWRITE_PROMPT = """The previous search query '{query}' did not retrieve enough contract clause information to answer the legal topic.
+Rewrite this query to be broader, using legal synonyms, contract terms, or different search angles to retrieve relevant clauses.
 Output ONLY the rewritten search query. No extra conversational text.
 
 Query: {query}"""
@@ -126,13 +126,13 @@ class CrossEncoderReranker:
 ### File 4: `Pipelines/ingestion.py`
 ```python
 import os
-import csv
-import json
+import re
 import uuid
 import tiktoken
 from tqdm import tqdm
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, SparseVectorParams, SparseIndexParams, PointStruct, SparseVector, PayloadSchemaType
+from fastembed import TextEmbedding, SparseTextEmbedding
 import config
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
@@ -161,7 +161,7 @@ class IngestionPipeline:
         print("Registering metadata payload indexes...")
         self.client.create_payload_index(
             collection_name=config.COLLECTION_NAME,
-            field_name="date",
+            field_name="year",
             field_schema=PayloadSchemaType.KEYWORD
         )
         self.client.create_payload_index(
@@ -228,89 +228,102 @@ class IngestionPipeline:
         return chunks
 
     def stream_local_documents(self, limit: int):
-        metadata_csv = os.path.join(config.DATASET_PATH, "metadata.csv")
-        if not os.path.exists(metadata_csv):
-            raise FileNotFoundError(f"metadata.csv not found at: {metadata_csv}")
+        # Support passing either the parent directory or the 'contracts' directory itself
+        if os.path.basename(config.DATASET_PATH.rstrip("/")) == "contracts":
+            contracts_dir = config.DATASET_PATH
+        else:
+            contracts_dir = os.path.join(config.DATASET_PATH, "contracts")
             
-        with open(metadata_csv, mode="r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            count = 0
+        if not os.path.exists(contracts_dir):
+            raise FileNotFoundError(f"Contracts directory not found at: {contracts_dir}")
             
-            for row in reader:
-                if count >= limit:
-                    break
-                
-                json_paths = row.get("pdf_json_files") or row.get("pmc_json_files")
-                body_sections = []
-                
-                if json_paths:
-                    first_rel_path = json_paths.split(";")[0].strip()
-                    full_json_path = os.path.join(config.DATASET_PATH, first_rel_path)
+        count = 0
+        for root, dirs, files in os.walk(contracts_dir):
+            for file in sorted(files):
+                if file.endswith(".txt"):
+                    if count >= limit:
+                        break
                     
-                    if os.path.exists(full_json_path):
-                        try:
-                            with open(full_json_path, mode="r", encoding="utf-8") as jf:
-                                json_data = json.load(jf)
-                                raw_body = json_data.get("body_text", [])
-                                for section in raw_body:
-                                    body_sections.append({
-                                        "title": section.get("section", "Section"),
-                                        "text": section.get("text", "")
-                                    })
-                        except Exception:
-                            continue
-                            
-                yield {
-                    "doc_id": row.get("cord_uid") or str(uuid.uuid4()),
-                    "title": row.get("title") or "Untitled Document",
-                    "doi": row.get("doi") or "N/A",
-                    "date": row.get("publish_time") or "N/A",
-                    "abstract": row.get("abstract") or "",
-                    "body": body_sections
-                }
-                count += 1
+                    file_path = os.path.join(root, file)
+                    year = os.path.basename(root)
+                    
+                    try:
+                        with open(file_path, mode="r", encoding="utf-8") as f:
+                            text = f.read()
+                    except Exception:
+                        continue
+                    
+                    lines = [line.strip() for line in text.split("\n") if line.strip()]
+                    contract_name = lines[0] if lines else "Unknown Contract"
+                    if len(contract_name) > 100:
+                        contract_name = contract_name[:97] + "..."
+                        
+                    yield {
+                        "doc_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, file_path)),
+                        "contract_name": contract_name,
+                        "file_name": file,
+                        "year": year,
+                        "text": text
+                    }
+                    count += 1
+            if count >= limit:
+                break
 
     def parse_document(self, doc: dict) -> list:
+        text = doc["text"]
         meta = {
             "doc_id": doc["doc_id"],
-            "title": doc["title"],
-            "doi": doc["doi"],
-            "date": doc["date"]
+            "contract_name": doc["contract_name"],
+            "file_name": doc["file_name"],
+            "year": doc["year"]
         }
-        chunks = []
         
-        # Abstract
-        abs_text = doc["abstract"]
-        if abs_text and len(abs_text.strip()) > 50:
-            for c_text in self.split_recursive_sentence(abs_text):
-                chunk = {"chunk_id": str(uuid.uuid4()), "chunk_text": c_text}
-                chunk.update(meta)
-                chunk["section"] = "Abstract"
-                chunks.append(chunk)
+        section_pattern = re.compile(r'^(SECTION\s+\d+\.\d+|ARTICLE\s+[IVXLCDM]+|EXHIBIT\s+[A-Z]|\bINDEMNITY\b|\bTERMINATION\b|\bLIMITATION\b)', re.IGNORECASE)
+        lines = text.split("\n")
+        current_section = "Preamble"
+        section_text_blocks = []
+        current_block = []
+        
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            
+            if section_pattern.match(stripped) and len(stripped) < 80:
+                if current_block:
+                    section_text_blocks.append((current_section, "\n".join(current_block)))
+                    current_block = []
+                current_section = stripped
+            else:
+                current_block.append(stripped)
                 
-        # Body
-        for idx, sec in enumerate(doc["body"]):
-            title = sec["title"]
-            text = sec["text"]
-            if text and len(text.strip()) > 50:
-                for c_text in self.split_recursive_sentence(text):
-                    chunk = {"chunk_id": str(uuid.uuid4()), "chunk_text": c_text}
+        if current_block:
+            section_text_blocks.append((current_section, "\n".join(current_block)))
+            
+        chunks = []
+        for section_name, section_text in section_text_blocks:
+            if len(section_text.strip()) > 50:
+                for c_text in self.split_recursive_sentence(section_text):
+                    chunk = {
+                        "chunk_id": str(uuid.uuid4()),
+                        "chunk_text": c_text,
+                        "section": section_name
+                    }
                     chunk.update(meta)
-                    chunk["section"] = title
                     chunks.append(chunk)
         return chunks
 
-    def run(self, limit: int = 1000):
+    def run(self, limit: int = 100):
         self.setup_collection()
         
-        print(f"Reading papers locally from {config.DATASET_PATH}...")
+        print(f"Reading contracts locally from {config.DATASET_PATH}...")
         doc_stream = self.stream_local_documents(limit)
         
         batch = []
         count = 0
         point_id = 1
         
-        for doc in tqdm(doc_stream, total=limit, desc="Processing files"):
+        for doc in tqdm(doc_stream, total=limit, desc="Processing contracts"):
             chunks = self.parse_document(doc)
             for chunk in chunks:
                 batch.append(chunk)
@@ -324,7 +337,7 @@ class IngestionPipeline:
         if batch:
             self.upload_batch(batch, point_id)
             
-        print(f"\nCompleted! Ingested {count} papers and registered chunks in Qdrant.")
+        print(f"\nCompleted! Ingested {count} contracts and registered chunks in Qdrant.")
 
     def upload_batch(self, batch_data: list, start_id: int):
         texts = [item["chunk_text"] for item in batch_data]
@@ -355,6 +368,7 @@ import json
 from groq import Groq
 from qdrant_client import QdrantClient
 from qdrant_client.models import SparseVector
+from fastembed import TextEmbedding, SparseTextEmbedding
 from langgraph.graph import StateGraph, END
 
 import config
@@ -419,7 +433,7 @@ class RAGAgentPipeline:
         query = state["original_query"]
         contexts = ""
         for idx, c in enumerate(state["reranked_chunks"]):
-            contexts += f"\nSOURCE [{idx+1}]: {c['title']} ({c['doi']}) Section: {c['section']}\nContent: {c['chunk_text']}\n"
+            contexts += f"\nSOURCE [{idx+1}]: {c['contract_name']} ({c['year']}) Section: {c['section']}\nContent: {c['chunk_text']}\n"
             
         comp = self.groq_client.chat.completions.create(
             messages=[{"role": "user", "content": prompts.GENERATION_PROMPT.format(query=query, contexts=contexts)}],
@@ -510,12 +524,12 @@ from ingestion import IngestionPipeline
 from agent import RAGAgentPipeline
 
 def main():
-    parser = argparse.ArgumentParser(description="Industrial CORD-19 LangGraph RAG CLI Pipeline")
+    parser = argparse.ArgumentParser(description="Industrial CUAD Legal Contracts LangGraph RAG CLI Pipeline")
     subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
     
     # Ingestion subcommand
-    ingest_parser = subparsers.add_parser("ingest", help="Ingest CORD-19 papers into Qdrant")
-    ingest_parser.add_argument("--limit", type=int, default=1000, help="Number of papers to process and index")
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest CUAD contracts into Qdrant")
+    ingest_parser.add_argument("--limit", type=int, default=100, help="Number of contracts to process and index")
     
     # Query subcommand
     query_parser = subparsers.add_parser("query", help="Run the RAG query agent")

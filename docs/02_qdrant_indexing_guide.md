@@ -1,15 +1,15 @@
-# Phase 2: Hybrid Indexing in Qdrant Guide (Updated)
+# Phase 2: Hybrid Indexing in Qdrant Guide
 **Notebook Target**: `notesbooks/02_qdrant_indexing.ipynb`
 
-Welcome to Phase 2. In this guide, we adapt Qdrant to index our sentence-aligned chunks.
+Welcome to Phase 2. In this guide, we adapt Qdrant to index our sentence-aligned legal contract chunks.
 
 We will learn how to:
 1. **Connect to Qdrant** (Docker container or local memory).
 2. **Configure a Hybrid Search Collection** (Dense semantic vectors + Sparse BM25 keyword indices).
-3. **Setup Payload Indexes** to enable fast metadata filtering on publication date and document section.
+3. **Setup Payload Indexes** to enable fast metadata filtering on contract year and clause section.
 4. **Use FastEmbed** to vectorize our chunk text.
 5. **Insert data and payloads** directly.
-6. **Run test queries** evaluating Dense, Sparse, and Hybrid searches.
+6. **Run test queries** evaluating Dense, Sparse, and Hybrid searches on contract clauses.
 
 ---
 
@@ -30,7 +30,7 @@ except Exception as e:
     print("Could not connect to local Docker Qdrant. Falling back to local in-memory instance.")
     client = QdrantClient(":memory:")
 
-COLLECTION_NAME = "cord19_advanced"
+COLLECTION_NAME = "cuad_advanced"
 ```
 
 ### Cell 2: Creating the Hybrid Search Collection
@@ -55,18 +55,18 @@ client.recreate_collection(
 print(f"Collection '{COLLECTION_NAME}' created and configured successfully for Hybrid Search!")
 ```
 
-### Cell 2.5: Setting up Payload Indexes (New)
-To allow our LangGraph agent to filter papers instantly by section (e.g., only "Methods") or by date, we create payload indexes on these fields:
+### Cell 2.5: Setting up Payload Indexes
+To allow our LangGraph agent to filter contracts instantly by section (e.g., only "Limitation of Liability") or by year, we create payload indexes on these fields:
 
 ```python
 from qdrant_client.models import PayloadSchemaType
 
 print("Creating payload indexes for metadata filtering...")
 
-# Index the 'date' field (Keyword index for fast comparison / filtering)
+# Index the 'year' field (Keyword index for fast comparison / filtering)
 client.create_payload_index(
     collection_name=COLLECTION_NAME,
-    field_name="date",
+    field_name="year",
     field_schema=PayloadSchemaType.KEYWORD
 )
 
@@ -94,33 +94,33 @@ print("FastEmbed models loaded and ready!")
 ```
 
 ### Cell 4: Generating Sample Data
-Simulated chunks matching the output of our Phase 1 sentence-aligned splitter:
+Simulated chunks matching the output of our Phase 1 sentence-aligned splitter for CUAD legal contracts:
 
 ```python
 sample_parsed_chunks = [
     {
         "chunk_id": "c1-uuid",
-        "chunk_text": "Clinical trials for Remdesivir (GS-5734) in patients hospitalized with COVID-19 have shown faster recovery rates compared to placebo controls. In a double-blind study of 1000 patients, patients receiving Remdesivir had a median recovery time of 10 days compared to 15 days for the placebo group. Antiviral efficacy was most pronounced in patients requiring oxygen support.",
-        "title": "Efficacy of Remdesivir in Hospitalized Patients",
-        "doi": "10.1056/NEJMoa2007764",
-        "date": "2020-10-12",
-        "section": "Results"
+        "chunk_text": "LIMITATION OF LIABILITY. Except for indemnity obligations under Article 8 or breach of confidentiality duties, in no event shall either party's aggregate liability under this Credit Agreement exceed $10,000,000. Neither party shall be liable for indirect, special, punitive, or consequential damages.",
+        "contract_name": "Applied Materials Credit Agreement",
+        "file_name": "000000000.txt",
+        "year": "2000",
+        "section": "SECTION 10.04. Limitation of Liability"
     },
     {
         "chunk_id": "c2-uuid",
-        "chunk_text": "A severe symptom of SARS-CoV-2 is acute respiratory distress syndrome (ARDS), leading to respiratory failure and requiring mechanical ventilation. Cytokine storm, characterized by elevated IL-6 and TNF-alpha, plays a major role in triggering ARDS and causing multi-organ dysfunction in critical patients.",
-        "title": "Pathophysiology of SARS-CoV-2 ARDS",
-        "doi": "10.1038/s41584-020-00448-w",
-        "date": "2020-05-18",
-        "section": "Introduction"
+        "chunk_text": "INDEMNIFICATION BY BORROWER. The Borrower agrees to indemnify, defend, and hold harmless the Agent and the Lenders from and against any losses, claims, damages, liabilities, and expenses arising out of the transactions contemplated by this 364-day Credit Agreement, except to the extent resulting from gross negligence.",
+        "contract_name": "Applied Materials Credit Agreement",
+        "file_name": "000000000.txt",
+        "year": "2000",
+        "section": "SECTION 9.03. Indemnification"
     },
     {
         "chunk_id": "c3-uuid",
-        "chunk_text": "Chloroquine and Hydroxychloroquine did not demonstrate clinical benefit in randomized trials of hospitalized COVID-19 patients. The RECOVERY trial showed no significant reduction in 28-day mortality for patients allocated to hydroxychloroquine compared to standard care. Consequently, clinical guidelines recommend against their use.",
-        "title": "Hydroxychloroquine Trials Review",
-        "doi": "10.1056/NEJMoa2022926",
-        "date": "2020-11-19",
-        "section": "Discussion"
+        "chunk_text": "GOVERNING LAW. This Credit Agreement shall be governed by, and construed in accordance with, the laws of the State of New York without regard to conflict of law principles. Any legal action arising hereunder shall be brought in the federal courts located in the Southern District of New York.",
+        "contract_name": "Applied Materials Credit Agreement",
+        "file_name": "000000000.txt",
+        "year": "2000",
+        "section": "SECTION 10.09. Governing Law"
     }
 ]
 
@@ -156,9 +156,9 @@ for idx, item in enumerate(sample_parsed_chunks):
         payload={
             "chunk_id": item["chunk_id"],
             "chunk_text": item["chunk_text"],
-            "title": item["title"],
-            "doi": item["doi"],
-            "date": item["date"],
+            "contract_name": item["contract_name"],
+            "file_name": item["file_name"],
+            "year": item["year"],
             "section": item["section"]
         }
     )
@@ -175,7 +175,7 @@ print(f"Uploaded {len(points)} vectors to Qdrant successfully!")
 
 ### Cell 6: Running Search Queries
 ```python
-query_text = "Does Remdesivir speed up recovery time?"
+query_text = "What is the liability cap under the Applied Materials contract?"
 
 # 1. Generate query vectors
 query_dense = list(dense_model.embed([query_text]))[0].tolist()
@@ -193,7 +193,7 @@ dense_results = client.search(
 )
 print("=== DENSE SEARCH RESULTS ===")
 for res in dense_results:
-    print(f"Score: {res.score:.4f} | Document: {res.payload['title']} | Chunk: '{res.payload['chunk_text'][:80]}...'")
+    print(f"Score: {res.score:.4f} | Contract: {res.payload['contract_name']} | Section: {res.payload['section']} | Chunk: '{res.payload['chunk_text'][:80]}...'")
 
 # 3. Search Sparse-Only
 sparse_results = client.search(
@@ -203,5 +203,5 @@ sparse_results = client.search(
 )
 print("\n=== SPARSE SEARCH RESULTS ===")
 for res in sparse_results:
-    print(f"Score: {res.score:.4f} | Document: {res.payload['title']} | Chunk: '{res.payload['chunk_text'][:80]}...'")
+    print(f"Score: {res.score:.4f} | Contract: {res.payload['contract_name']} | Section: {res.payload['section']} | Chunk: '{res.payload['chunk_text'][:80]}...'")
 ```

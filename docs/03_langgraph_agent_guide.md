@@ -1,12 +1,12 @@
-# Phase 3: LangGraph Agent & Self-Correction Loop Guide (Updated)
+# Phase 3: LangGraph Agent & Self-Correction Loop Guide
 **Notebook Target**: `notesbooks/03_langgraph_agent.ipynb`
 
-Welcome to Phase 3. In this updated guide, we build our RAG agent to run directly on the **Sentence-Aligned Chunks** we defined in Phase 1 & 2.
+Welcome to Phase 3. In this updated guide, we build our RAG agent to run directly on the **Sentence-Aligned Chunks** we defined in Phase 1 & 2 for CUAD contracts.
 
 We will learn how to:
 1. **Define a State Machine** in LangGraph containing our query state, retrieval lists, and retry statistics.
 2. **Implement Node Functions** for query expansion, parallel hybrid retrieval, RRF scoring, Cross-Encoder reranking, and Groq-based generation.
-3. **Build LLM-based Grading Nodes** to verify that answers are fully grounded in the source context and answer the original prompt.
+3. **Build LLM-based Grading Nodes** to verify that answers are fully grounded in the source contracts and answer the original legal query.
 4. **Implement a Self-Correction Edge** that loops back to rewrite and re-search the database if the answers fail validation.
 
 ---
@@ -44,7 +44,7 @@ except Exception:
 dense_model = TextEmbedding("BAAI/bge-small-en-v1.5")
 sparse_model = SparseTextEmbedding("Qdrant/bm25")
 
-COLLECTION_NAME = "cord19_advanced"
+COLLECTION_NAME = "cuad_advanced"
 print("Environment set up successfully!")
 ```
 
@@ -111,8 +111,8 @@ def expand_query_node(state: AgentState) -> dict:
     query = state["current_query"]
     print(f"\n[Node: expand_query] Expanding query: '{query}'")
     
-    prompt = f"""You are a scientific research search assistant.
-Generate exactly 3 variations of the following search query to help retrieve scientific papers from a vector database.
+    prompt = f"""You are a legal research search assistant.
+Generate exactly 3 variations of the following search query to help retrieve relevant clauses (such as termination, indemnity, limitation of liability) from a legal contract vector database.
 Generate ONLY the 3 queries, one per line. Do not number them or add any introductory text.
 
 Original Query: {query}"""
@@ -184,7 +184,7 @@ def rerank_node(state: AgentState) -> dict:
     scored_candidates.sort(key=lambda x: x["rerank_score"], reverse=True)
     top_5 = scored_candidates[:5]
     
-    print(f"Top reranked chunk score: {top_5[0]['rerank_score']:.4f} | Document: {top_5[0]['title']}")
+    print(f"Top reranked chunk score: {top_5[0]['rerank_score']:.4f} | Contract: {top_5[0]['contract_name']}")
     return {"reranked_chunks": top_5}
 ```
 
@@ -200,13 +200,14 @@ def generate_node(state: AgentState) -> dict:
     for idx, ctx in enumerate(contexts):
         formatted_contexts += f"""---
 SOURCE [{idx + 1}]:
-TITLE: {ctx['title']}
-DOI: {ctx['doi']}
+CONTRACT NAME: {ctx['contract_name']}
+FILE NAME: {ctx['file_name']}
+YEAR: {ctx['year']}
 SECTION: {ctx['section']}
 CONTENT: {ctx['chunk_text']}
 """
         
-    prompt = f"""You are an expert scientific researcher. Answer the query based ONLY on the provided sources below.
+    prompt = f"""You are an expert corporate lawyer. Answer the query based ONLY on the provided contract sources below.
 Use inline citations when stating facts (e.g. "Fact [SOURCE 1]").
 If the context does not contain enough information to answer the query, reply with: 'INSUFFICIENT_CONTEXT'
 
@@ -242,7 +243,7 @@ def grader_node(state: AgentState) -> dict:
         
     context_text = "\n\n".join([c["chunk_text"] for c in contexts])
     
-    grader_prompt = f"""Analyze if the Candidate Response is fully grounded and supported by the Reference Context.
+    grader_prompt = f"""Analyze if the Candidate Response is fully grounded and supported by the Reference Context (legal contracts).
 Also check if it directly answers the User Query.
 Respond in exactly this JSON format:
 {{
@@ -272,8 +273,8 @@ def feedback_rewrite_node(state: AgentState) -> dict:
     retry = state["retry_count"]
     print(f"\n[Node: feedback_rewrite] Self-Correction triggered (Retry #{retry + 1}). Rewriting search parameters...")
     
-    prompt = f"""The previous search query '{query}' did not retrieve enough information to answer the research topic.
-Rewrite this query to be broader, using clinical synonyms or different search angles to retrieve relevant scientific results.
+    prompt = f"""The previous search query '{query}' did not retrieve enough contract clause information to answer the legal topic.
+Rewrite this query to be broader, using legal synonyms, contract terms, or different search angles to retrieve relevant clauses.
 Output ONLY the rewritten search query. No extra conversational text.
 
 Query: {query}"""
@@ -342,8 +343,8 @@ print("LangGraph Agent compiled successfully!")
 ### Cell 11: Running the Agent
 ```python
 inputs = {
-    "original_query": "What are the clinical efficacy results of Remdesivir against placebo?",
-    "current_query": "What are the clinical efficacy results of Remdesivir against placebo?",
+    "original_query": "What is the liability cap under the Applied Materials contract?",
+    "current_query": "What is the liability cap under the Applied Materials contract?",
     "expanded_queries": [],
     "retrieved_chunks": [],
     "reranked_chunks": [],

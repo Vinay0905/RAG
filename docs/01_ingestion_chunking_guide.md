@@ -1,12 +1,12 @@
 # Phase 1: Local Ingestion & Recursive Sentence-Aligned Chunking Guide
 **Notebook Target**: `notesbooks/01_ingestion_chunking.ipynb`
 
-Welcome to Phase 1. In this updated guide, we implement a highly intuitive, production-ready **Recursive Sentence-Aligned Chunking** strategy to ingest our CORD-19 data.
+Welcome to Phase 1. In this updated guide, we implement a highly intuitive, production-ready **Recursive Sentence-Aligned Chunking** strategy to ingest our CUAD (Contract Understanding Atticus Dataset) commercial legal agreements.
 
 We will learn how to:
-1. **Stream CORD-19 locally** from `metadata.csv` using a generator.
-2. **Parse structured sections** (`Abstract`, `Methods`, etc.).
-3. **Recursively split text** at sentence boundaries (`. `) to build chunks of ~400 tokens, avoiding cutting sentences in half and removing parent-child mapping complexity.
+1. **Stream CUAD contracts locally** from subdirectories in `dataset/contracts/` using a generator.
+2. **Parse structured sections** (`Preamble`, `SECTION ...`, `ARTICLE ...`, etc.) from raw text files.
+3. **Recursively split text** at sentence boundaries (`. `) to build chunks of ~400 tokens, avoiding cutting sentences in half and maintaining context.
 
 ---
 
@@ -16,8 +16,10 @@ Ensure your downloaded dataset directory (`dataset/`) is placed in the project r
 ```
 RAG/
 ├── dataset/
-│   ├── metadata.csv
-│   └── document_parses/
+│   └── contracts/
+│       ├── 2000/
+│       ├── 2001/
+│       └── ...
 ├── notesbooks/
 │   └── 01_ingestion_chunking.ipynb
 └── docs/
@@ -35,8 +37,7 @@ Initializes libraries and the token length calculator.
 
 ```python
 import os
-import csv
-import json
+import re
 import uuid
 import tiktoken
 from tqdm import tqdm
@@ -123,102 +124,119 @@ def split_recursive_sentence(text: str, max_tokens: int = 400, sentence_overlap:
     return chunks
 ```
 
-### Cell 3: Local CORD-19 Generator Stream
-Streams metadata CSV and reads relative JSON file paths from disk.
+### Cell 3: Local CUAD Contract Generator Stream
+Recursively walks `dataset/contracts/` to stream text agreements along with metadata (year, contract name, etc.).
 
 ```python
-def stream_local_cord19(dataset_dir: str, limit: int = 100):
-    metadata_path = os.path.join(dataset_dir, "metadata.csv")
-    if not os.path.exists(metadata_path):
-        raise FileNotFoundError(f"metadata.csv not found at: {metadata_path}")
+def stream_local_cuad(dataset_dir: str, limit: int = 100):
+    # Support passing either the parent directory or the 'contracts' directory itself
+    if os.path.basename(dataset_dir.rstrip("/")) == "contracts":
+        contracts_dir = dataset_dir
+    else:
+        contracts_dir = os.path.join(dataset_dir, "contracts")
         
-    with open(metadata_path, mode="r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        count = 0
+    if not os.path.exists(contracts_dir):
+        raise FileNotFoundError(f"Contracts directory not found at: {contracts_dir}")
         
-        for row in reader:
-            if count >= limit:
-                break
-            
-            json_paths = row.get("pdf_json_files") or row.get("pmc_json_files")
-            body_sections = []
-            
-            if json_paths:
-                first_rel_path = json_paths.split(";")[0].strip()
-                full_json_path = os.path.join(dataset_dir, first_rel_path)
+    count = 0
+    for root, dirs, files in os.walk(contracts_dir):
+        for file in sorted(files):
+            if file.endswith(".txt"):
+                if count >= limit:
+                    break
                 
-                if os.path.exists(full_json_path):
-                    try:
-                        with open(full_json_path, mode="r", encoding="utf-8") as jf:
-                            json_data = json.load(jf)
-                            raw_body = json_data.get("body_text", [])
-                            for section in raw_body:
-                                body_sections.append({
-                                    "title": section.get("section", "Section"),
-                                    "text": section.get("text", "")
-                                })
-                    except Exception:
-                        continue
-            
-            yield {
-                "doc_id": row.get("cord_uid") or str(uuid.uuid4()),
-                "title": row.get("title") or "Untitled Document",
-                "doi": row.get("doi") or "N/A",
-                "date": row.get("publish_time") or "N/A",
-                "abstract": row.get("abstract") or "",
-                "body": body_sections
-            }
-            count += 1
+                file_path = os.path.join(root, file)
+                # In CUAD directory structure, the parent folder name represents the contract year
+                year = os.path.basename(root)
+                
+                try:
+                    with open(file_path, mode="r", encoding="utf-8") as f:
+                        text = f.read()
+                except Exception:
+                    continue
+                
+                # Determine contract name/title from first non-empty lines
+                lines = [line.strip() for line in text.split("\n") if line.strip()]
+                contract_name = lines[0] if lines else "Unknown Contract"
+                if len(contract_name) > 100:
+                    contract_name = contract_name[:97] + "..."
+                
+                yield {
+                    "doc_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, file_path)),
+                    "contract_name": contract_name,
+                    "file_name": file,
+                    "year": year,
+                    "text": text
+                }
+                count += 1
+        if count >= limit:
+            break
 ```
 
-### Cell 4: Section-Aware Parser & Ingestion Execution
-We run the parser over the first **5 local files**.
+### Cell 4: Section-Aware Contract Parser & Ingestion Execution
+Reads raw contract text and segments it into sections based on typical contract headings (e.g. `SECTION ...` or `ARTICLE ...`), then runs the sentence-aligned splitter on the text within each section. We run the parser over the first **3 contracts**.
 
 ```python
-def parse_local_document(doc: dict) -> list:
+def parse_cuad_document(doc: dict) -> list:
+    text = doc["text"]
     metadata = {
         "doc_id": doc["doc_id"],
-        "title": doc["title"],
-        "doi": doc["doi"],
-        "date": doc["date"]
+        "contract_name": doc["contract_name"],
+        "file_name": doc["file_name"],
+        "year": doc["year"]
     }
-    all_chunks = []
     
-    # 1. Parse Abstract
-    abstract_text = doc["abstract"]
-    if abstract_text and len(abstract_text.strip()) > 50:
-        abs_chunks = split_recursive_sentence(abstract_text)
-        for chunk_text in abs_chunks:
-            chunk = {"chunk_id": str(uuid.uuid4()), "chunk_text": chunk_text}
-            chunk.update(metadata)
-            chunk["section"] = "Abstract"
-            all_chunks.append(chunk)
+    # Identify Section or Article patterns
+    section_pattern = re.compile(r'^(SECTION\s+\d+\.\d+|ARTICLE\s+[IVXLCDM]+|EXHIBIT\s+[A-Z]|\bINDEMNITY\b|\bTERMINATION\b|\bLIMITATION\b)', re.IGNORECASE)
+    
+    lines = text.split("\n")
+    current_section = "Preamble"
+    section_text_blocks = []
+    current_block = []
+    
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        
+        # Check if line indicates a section boundary / heading
+        if section_pattern.match(stripped) and len(stripped) < 80:
+            if current_block:
+                section_text_blocks.append((current_section, "\n".join(current_block)))
+                current_block = []
+            current_section = stripped
+        else:
+            current_block.append(stripped)
             
-    # 2. Parse Body Sections
-    for idx, section in enumerate(doc["body"]):
-        title = section["title"]
-        text = section["text"]
-        if text and len(text.strip()) > 50:
-            sec_chunks = split_recursive_sentence(text)
-            for chunk_text in sec_chunks:
-                chunk = {"chunk_id": str(uuid.uuid4()), "chunk_text": chunk_text}
+    if current_block:
+        section_text_blocks.append((current_section, "\n".join(current_block)))
+        
+    all_chunks = []
+    for section_name, section_text in section_text_blocks:
+        if len(section_text.strip()) > 50:
+            chunks = split_recursive_sentence(section_text)
+            for chunk_text in chunks:
+                chunk = {
+                    "chunk_id": str(uuid.uuid4()),
+                    "chunk_text": chunk_text,
+                    "section": section_name
+                }
                 chunk.update(metadata)
-                chunk["section"] = title
                 all_chunks.append(chunk)
                 
     return all_chunks
 
 DATASET_PATH = "/Users/mast/Documents/VInayPrograming/RAG/dataset"
 
-print(f"Reading local documents from: {DATASET_PATH}")
+print(f"Reading local CUAD documents from: {DATASET_PATH}")
 sample_chunks = []
 
-doc_stream = stream_local_cord19(DATASET_PATH, limit=5)
-for doc in tqdm(doc_stream, total=5, desc="Parsing local files"):
-    doc_chunks = parse_local_document(doc)
+doc_stream = stream_local_cuad(DATASET_PATH, limit=3)
+for doc in tqdm(doc_stream, total=3, desc="Parsing contract text"):
+    doc_chunks = parse_cuad_document(doc)
     sample_chunks.extend(doc_chunks)
 
-print(f"\nGenerated a total of {len(sample_chunks)} Sentence-Aligned chunks from local files.")
+print(f"\nGenerated a total of {len(sample_chunks)} Sentence-Aligned chunks from contracts.")
 ```
 
 ### Cell 5: Inspect Ingestion Output
@@ -228,12 +246,14 @@ Let's print a sample chunk to verify.
 if sample_chunks:
     sample = sample_chunks[0]
     print("=== INSPECTING LOCAL SAMPLE CHUNK ===")
-    print(f"Document Title : {sample['title']}")
-    print(f"Section Name   : {sample['section']}")
-    print(f"Chunk ID       : {sample['chunk_id']}")
-    print(f"Chunk Tokens   : {get_token_len(sample['chunk_text'])} tokens")
+    print(f"Contract Name : {sample['contract_name']}")
+    print(f"File Name     : {sample['file_name']}")
+    print(f"Year          : {sample['year']}")
+    print(f"Section Name  : {sample['section']}")
+    print(f"Chunk ID      : {sample['chunk_id']}")
+    print(f"Chunk Tokens  : {get_token_len(sample['chunk_text'])} tokens")
     print("\n--- Chunk Text ---")
     print(sample['chunk_text'])
 else:
-    print("No chunks generated. Make sure CORD-19 is downloaded to the dataset/ folder.")
+    print("No chunks generated. Make sure CUAD is downloaded to the dataset/ contracts directory.")
 ```
