@@ -1,64 +1,79 @@
 # 🔮 Future Ideas & Industrial RAG Challenges (`future_ideas_problems.md`)
 
-This document tracks complex industrial RAG challenges, advanced multimodal capabilities (PDF Tabular Data, Images, Charts), Knowledge Graphs (GraphRAG), and future architectural expansions.
+This document tracks complex real-world industrial RAG problems that **our baseline architecture DOES NOT YET SOLVE**, along with the architectural extensions required to fix them in production.
 
 ---
 
-## 📌 1. Complex Multimodal & Tabular Data Challenges
+## 🛑 Real Industrial Problems Our Current Baseline System DOES NOT Solve
 
-### 📊 Challenge A: PDF Tabular Data Interpretation
-* **Problem**: Standard text extractors flatten tables into unstructured text strings. Row-column relationships are lost, causing LLMs to misinterpret financial metrics, legal fee schedules, or liability threshold matrices in contract PDFs.
-* **Production Solution**:
-  1. **Structure-Aware Table Parsers**: Use `pdfplumber`, `unstructured`, or `PyMuPDF` to detect bounding boxes around tables.
-  2. **Table-to-Markdown / HTML Conversion**: Convert extracted tables into clean Markdown table formats (`| Column 1 | Column 2 |`) or HTML `<table>` tags before chunking.
-  3. **Row-Level Entity Metadata Payload**: Index each table row as a standalone chunk enriched with table header context (e.g. `[Table: Liability Matrix, Row: 2024 Threshold = $5M]`).
+While our baseline system (Phases 1–10) solves single-document retrieval, hallucinations, and basic vector search, the following 6 enterprise edge cases will fail on a basic RAG setup:
 
 ---
 
-### 🖼️ Challenge B: Non-Text Content (Images, Scanned Diagrams & Figures)
-* **Problem**: Scanned contract signatures, corporate hierarchy diagrams, flowcharts, and embedded image figures are invisible to standard text embedding models.
-* **Production Solution**:
-  1. **Multimodal Vision OCR Engine**: Process image blocks with Vision LLMs (e.g., Llama-3.2-Vision, GPT-4o-Vision, or Tesseract OCR).
-  2. **Synthetic Image Captioning**: Automatically generate detailed text summaries describing the visual content (e.g., *"Flowchart illustrating dispute escalation procedure between Party A and Party B"*).
-  3. **Dual Text-Image Vector Indexing**: Store visual synthetic captions in the vector database alongside image file URI references.
+### 1. 🏢 Enterprise Permission Leakage & Multi-Tenant Access Control (ACL)
+* **The Failure**: In real companies (Sharepoint, Confluence, Google Drive), User A (Junior Associate) should NOT see executive compensation contracts, while User B (Partner) can see everything.
+* **Why Our Baseline Fails**: Qdrant currently searches across all indexed contracts globally without evaluating user identity or role permissions during vector similarity lookup.
+* **The Fix Required**:
+  - Attach User/Group ACL tokens to chunk metadata (`allowed_roles: ["legal_partner", "admin"]`).
+  - Inject security session context into Qdrant queries to execute pre-search RBAC payload filtering.
 
 ---
 
-### 🕸️ Challenge C: Knowledge Graphs & GraphRAG for Complex Relationships
-* **Problem**: Pure vector similarity struggle with multi-hop relational questions (e.g., *"Find all contracts where Entity A indemnifies Entity B, and identify which governing law applies if Entity C terminates"*).
-* **Production Solution (GraphRAG)**:
-  1. **Entity-Relation Extraction**: Use LLMs during ingestion to extract structured entities (`Company`, `Clause`, `Jurisdiction`) and relations (`INDEMNIFIES`, `GOVERNED_BY`, `SUPERSEDES`).
-  2. **Knowledge Graph DB Integration**: Index extracted triples into a graph database like **Neo4j** or **NetworkX**.
-  3. **Hybrid Graph + Vector Retrieval**: Execute graph traversal queries combined with vector similarity search to answer multi-hop legal relationship questions accurately.
+### 2. 📊 Multi-Document Aggregation & Bulk Map-Reduce Queries
+* **The Failure**: Questions like *"Scan all 200 contracts and list every vendor whose termination notice period is under 30 days"* or *"Compare Section 4 across Contract A, B, and C"*.
+* **Why Our Baseline Fails**: Standard vector retrieval returns the Top-5 chunks (1% of the database). It cannot map/reduce or iterate across 200 documents simultaneously.
+* **The Fix Required**:
+  - Implement a **Map-Reduce Execution Node** in LangGraph.
+  - Run asynchronous parallel metadata query batches across document IDs, aggregating tabular summaries before final synthesis.
 
 ---
 
-## 🏢 2. Comprehensive Industrial Production Challenges & Solutions
-
-| Industrial Challenge | Why It Occurs | Enterprise Production Solution |
-| :--- | :--- | :--- |
-| **1. Document Versioning & Knowledge Staleness** | HR policies or contract revisions create conflicting `v1.0` vs `v2.0` chunks in vector stores. | **Version Metadata Tags (`version: "2.0"`, `is_active: True`) + Qdrant Active Payload Filters + Checksum Ingestion Tracking.** |
-| **2. Tabular Data Loss in PDFs** | Plain text extractors collapse table borders into unreadable string soup. | **PDF Table Parsers (`pdfplumber`) converting tables to Markdown & HTML JSON rows.** |
-| **3. Non-Text Image & Diagram Blind Spots** | Scanned figures and workflow diagrams are ignored by text embedders. | **Multimodal Vision LLM synthetic captioning + Image OCR metadata indexing.** |
-| **4. Multi-Hop Relational Queries** | Vector similarity fails to connect entities linked across multiple sections. | **GraphRAG (Neo4j / NetworkX) combining Entity-Relation graphs with vector search.** |
-| **5. Context Window & Attention Overflow** | Passing 20 raw chunks dilutes attention, causing "Lost in the Middle" errors. | **Cross-Encoder Reranking (`ms-marco-MiniLM`) + MMR Diversity Filtering.** |
-| **6. Un-Grounded Hallucinations** | LLMs output plausible-sounding facts missing from reference context. | **LangGraph Self-Correction Loop + Fact-Checking Grader Node + Query Rewriting.** |
-| **7. High Latency & API Cost Explosions** | Redundant queries trigger repetitive LLM calls and vector searches. | **Redis Semantic Cache (Cosine similarity threshold = 0.92) + Async WebSockets/SSE.** |
+### 3. 🕸️ Multi-Hop Relational Inheritance (Requires GraphRAG)
+* **The Failure**: Questions involving multi-tiered legal chains: *"Contract A states it inherits liability terms from Master Agreement B, which is governed by Parent Subsidiary C. What is Entity A's ultimate liability limit?"*
+* **Why Our Baseline Fails**: Bi-encoder vector similarity matches chunks containing keywords like "Liability" or "Master Agreement", but cannot traverse a 3-hop graph chain of legal inheritance.
+* **The Fix Required**:
+  - Implement **GraphRAG (Neo4j / NetworkX)**.
+  - Store extracted Entity-Relationship triples (`Contract A` --`INHERITS`--> `Agreement B` --`GOVERNED_BY`--> `Subsidiary C`).
 
 ---
 
-## 🚀 3. Roadmap for Future System Expansion
+### 4. 📄 Complex PDF Layout Degradation (Multi-Column, Scanned OCR, Bounding Boxes)
+* **The Failure**: Scanned contract PDFs, multi-column layouts, embedded Excel tables, or signed signature pages.
+* **Why Our Baseline Fails**: Standard text file loaders flatten text coordinates, merging side-by-side columns into unreadable text soup and completely missing scanned image figures.
+* **The Fix Required**:
+  - Replace basic text loaders with **Layout-Aware PDF Parsers** (`pdfplumber` / `unstructured`) and Vision LLM OCR models (Llama-3.2-Vision).
 
-```text
-               FUTURE RAG EXTENSION ROADMAP
-               
-  Phase 1-10 (Current Engine) ──► Phase 11: Tabular PDF & Vision Engine
-                                       │
-                                       ▼
-  Phase 13: Multi-Source Connectors ◄── Phase 12: GraphRAG Neo4j Integration
-  (Google Drive, S3, SQL DBs)
-```
+---
 
-1. **Phase 11: PDF Tabular Data & Vision Captioning Engine** (`src/ingestion/multimodal/`)
-2. **Phase 12: GraphRAG Knowledge Graph Integration** (`src/graph/knowledge_graph.py`)
-3. **Phase 13: Enterprise Multi-Source Connectors** (`src/ingestion/connectors/`)
+### 5. 🔄 Embedding Drift & Vector Migration Regressions
+* **The Failure**: Upgrading your embedding model (e.g. from `bge-small` to `bge-large` or OpenAI `text-embedding-3-large`).
+* **Why Our Baseline Fails**: Changing an embedding model invalidates all historical vector distance metrics in Qdrant, breaking existing vector indexes instantly.
+* **The Fix Required**:
+  - Implement a **Shadow Dual-Indexing Pipeline**.
+  - Maintain legacy and new vector collections simultaneously in Qdrant, running background re-indexing before switching traffic.
+
+---
+
+### 6. 📜 Whole-Document Summarization (Context Window Overflow)
+* **The Failure**: Asking *"Give me a comprehensive 10-page summary of this 300-page merger agreement"*.
+* **Why Our Baseline Fails**: Top-K reranking retrieves 5 small chunks (~2,000 tokens), missing 99% of the full 300-page document.
+* **The Fix Required**:
+  - Implement **Hierarchical Summary Tree Indexing** (RAPTOR architecture).
+  - Pre-summarize sections and chapters recursively during ingestion so high-level summary nodes exist in the vector store alongside fine-grained sentence chunks.
+
+---
+
+## 📑 Summary Matrix: Solved vs. Unsolved in Baseline Architecture
+
+| RAG Challenge | Solved by Our Baseline Architecture (Phases 1-10)? | Require Future Extension (Phases 11-15)? |
+| :--- | :---: | :---: |
+| **Hallucination & Fact Checking** | ✅ YES (LangGraph Grader) | — |
+| **Hybrid Search Precision** | ✅ YES (Dense + Sparse BM25 + RRF) | — |
+| **Context Quality & Reranking** | ✅ YES (Cross-Encoder Reranker) | — |
+| **Semantic Response Caching** | ✅ YES (Redis Vector Cache) | — |
+| **Document Versioning** | ✅ YES (Metadata Version Tags + Differential SHA-256) | — |
+| **Multi-Tenant Security & ACL** | ❌ NO | 🔨 Needs RBAC Payload Filter Middleware |
+| **Bulk Multi-Doc Aggregation** | ❌ NO | 🔨 Needs Map-Reduce Execution Node |
+| **Multi-Hop Legal Inheritance** | ❌ NO | 🔨 Needs GraphRAG (Neo4j Triples) |
+| **Scanned PDF Layouts & Tables** | ❌ NO | 🔨 Needs Vision OCR & `pdfplumber` |
+| **Whole-Document Summarization** | ❌ NO | 🔨 Needs RAPTOR Summary Tree Indexing |
