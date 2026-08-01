@@ -6,7 +6,7 @@
 > your next document must honour.
 >
 > Internal working file — not one of the study guides. Keep it updated at the end of every session.
-> Last updated: end of session 3 (2026-08-01).
+> Last updated: end of session 4 (2026-08-01).
 
 ---
 
@@ -64,14 +64,14 @@ the EDGAR corpus size forces.
 | File | Lines | State |
 | :--- | ---: | :--- |
 | `docs/00_MASTER_ROADMAP.md` | ~540 | ✅ current (corrected in session 2) |
-| `docs/Phase1_System_Foundations.md` | ~2,625 | ✅ current (rewritten + corrected; async-embedding prose fixed session 3) |
+| `docs/Phase1_System_Foundations.md` | ~2,645 | ✅ current (async-embedding prose fixed s3; `fetch_by_ids` + reranker model name fixed s4) |
 | `docs/Phase2_Ingestion_Engine.md` | ~2,950 | ✅ current (rewritten session 2) |
-| `docs/Phase3_VectorStores_Embeddings.md` | ~1,750 | ✅ current (rewritten session 3) |
+| `docs/Phase3_VectorStores_Embeddings.md` | ~1,790 | ✅ current (rewritten s3; `fetch_by_ids` added s4) |
+| `docs/Phase4_Hybrid_Retrieval_Reranking.md` | ~1,900 | ✅ current (rewritten session 4) |
 
 ### Still the OLD drafts — must be rewritten
-`Phase4_Hybrid_Retrieval_Reranking.md`, `Phase5_LangGraph_Agent.md`,
-`Phase6_LLM_Cache_Guardrails.md`, `Phase7_LLMOps_Evaluation.md`, `Phase8_FastAPI_Server.md`,
-`Phase9_CLI_Web_UI.md`, `Phase10_Testing_Verification.md`.
+`Phase5_LangGraph_Agent.md`, `Phase6_LLM_Cache_Guardrails.md`, `Phase7_LLMOps_Evaluation.md`,
+`Phase8_FastAPI_Server.md`, `Phase9_CLI_Web_UI.md`, `Phase10_Testing_Verification.md`.
 **Phases 11–16 do not exist yet.**
 
 ### Reference only — superseded, do not delete, do not follow
@@ -80,23 +80,24 @@ the EDGAR corpus size forces.
 Where they conflict with a rewritten phase, **the phase wins**.
 
 ### ▶ IMMEDIATE NEXT ACTION
-Rewrite **`Phase4_Hybrid_Retrieval_Reranking.md`**, then **`Phase5_LangGraph_Agent.md`**
-(**verify LangGraph's current API by web search before writing Phase 5** — see §7).
+Rewrite **`Phase5_LangGraph_Agent.md`**, then **`Phase6_LLM_Cache_Guardrails.md`**.
 
-Phase 4 must honour, at minimum:
-- Consume `store.hybrid_search(dense_query, sparse_query, limit, filters)` from Phase 3. It returns
-  `list[ScoredChunk]`; access text as `scored.chunk.text`. `rerank_score` is `None` until the
-  reranker sets it, and `effective_score` falls back to `score`.
-- **Filter every search to `{"chunk_level": "child"}`, then substitute parents before generation**
-  (fetch parents by `parent_id`; they live in the same collection).
-- Only these filter fields are supported and unknown keys **raise**: `doc_id`, `chunk_level`,
-  `year`, `section_title`. Value shapes: scalar (exact), list (any), `{"gte":, "lte":}` (range).
-- Sparse *query* vectors come from `FastEmbedProvider.embed_sparse_query_sync(text)` — a
-  concrete-provider method, deliberately not on `BaseEmbeddingProvider`.
-- `PREFETCH_MULTIPLIER` already controls candidate depth inside the store; do not re-implement
-  fusion client-side. RRF happens server-side.
-- Files per the roadmap tree: `src/retrieval/` — `multi_query.py`, `hyde.py`, `fusion.py`,
-  `hybrid.py`, `rerankers/{base,cross_encoder,mmr}.py`, `pipeline.py`.
+**Before writing Phase 5, verify LangGraph by web search** (§7 lists what): current `StateGraph`
+construction, `add_conditional_edges` signature, `langgraph-checkpoint-sqlite` usage, recursion-limit
+handling. This is non-negotiable — LangGraph's API has churned more than anything else in the stack.
+
+Phase 5 must honour:
+- **Phase 4's optional-LLM trick does not extend to Phase 5.** A generation node cannot degrade to
+  "no LLM". Either write Phase 6 first, or define the nodes against `BaseLLMProvider` and make the
+  *graph* the thing Phase 6 completes. Decide explicitly and say which in the doc.
+- State is a **TypedDict** (`StateGraph(AgentState)`, never `StateGraph(dict)`).
+- `RetrievalPipeline.retrieve(query, top_k, filters) -> RetrievalResult` is the retrieval node's
+  entire surface. Do not reach past it into the store or the reranker.
+- `GradingReport.passed` (= `is_grounded and is_relevant`) drives the retry edge;
+  `settings.MAX_RETRIES` bounds it; exhaustion raises `MaxRetriesExceededError`.
+- Sources reaching generation are **parents** (`chunk_level == PARENT`) with the parent's
+  `chunk_id` — so `Citation.chunk_id` must match the parent, not the child that was retrieved.
+- Prompts all live in `src/graph/prompts.py`. Never log a generated answer or a source body (§7.5).
 
 ---
 
@@ -107,7 +108,7 @@ Phase 4 must honour, at minimum:
 | 1 | System Foundations | 1,000 ✅ |
 | 2 | Ingestion at Scale | 1,600 ✅ |
 | 3 | Embeddings & Vector Stores | 1,450 ✅ |
-| 4 | Hybrid Retrieval & Reranking | 700 |
+| 4 | Hybrid Retrieval & Reranking | 1,200 ✅ |
 | 5 | LangGraph Agent | 900 |
 | 6 | LLM, Cache & Guardrails | 700 |
 | 7 | LLMOps & Evaluation | 600 |
@@ -246,6 +247,14 @@ a full scan).
 - Ingestion is sync + `multiprocessing` on purpose (GIL). Workers do CPU only and return picklable
   `Chunk` lists; the parent does all I/O. Windows **requires** `if __name__ == "__main__":`.
 
+### ⚠️ INTERFACE ADDITION made in session 4 — `BaseVectorStore.fetch_by_ids`
+`async fetch_by_ids(ids: Sequence[str]) -> list[Chunk]`. Additive only; nothing existing changed.
+Needed because `chunk_id` is **not** a filterable field, so Phase 4's parent substitution (and
+Phases 13/16's reference walking) cannot use `hybrid_search`. Missing IDs are **skipped, not raised**
+— an absent parent degrades to the child. Already written into Phase 1's `interfaces.py` and both
+Phase 3 stores (`QdrantStore` uses `client.retrieve(..., with_vectors=False)`; `ChromaStore` uses
+`collection.get(ids=...)`). Any future store must implement it.
+
 ### Phase 3 surface — now also frozen (written session 3)
 - `src/embeddings/base.py`: `DEFAULT_BATCH_SIZE`, `MAX_INPUT_TOKENS`, `batched()`,
   `EmbeddingProviderBase` (`_prepare`, `_check_alignment`), `LocalEmbeddingProvider` (abstract
@@ -313,6 +322,50 @@ await client.query_points(
 Requires Qdrant **≥ 1.10** (Universal Query API). Prefetch limits must be ≥ main `limit + offset` or
 you get empty results. Prefetches can nest. **Deprecated — never use:** `client.search(...)`,
 `client.recreate_collection(...)`. Use `collection_exists()` + `create_collection()`.
+
+### Phase 4 surface — frozen (written session 4)
+- `src/retrieval/`: `multi_query.py` (`QueryExpander`, `QueryVariations`), `hyde.py`
+  (`HyDEGenerator`), `hybrid.py` (`HybridRetriever`, `SearchOutcome`), `fusion.py`
+  (`reciprocal_rank_fusion`), `parents.py` (`ParentSubstituter`),
+  `rerankers/{base.py: RerankerBase, cross_encoder.py: CrossEncoderReranker, mmr.py: MMRReranker}`,
+  `pipeline.py` (`RetrievalPipeline.retrieve -> RetrievalResult`).
+- **`parents.py` is a tree addition** (roadmap lists neither it nor `src/pipelines/` from Phase 3 —
+  update the tree when next touching the roadmap).
+- **Phase 4 does NOT depend on Phase 6.** `QueryExpander` / `HyDEGenerator` take
+  `llm: BaseLLMProvider | None`; with `None` they no-op and log it. This is what allowed 4 before 6,
+  and Phase 10 tests retrieval with no API key. **This trick does not extend to Phase 5's generation
+  node.**
+- **Stage order is a decision, not a style:** expand+HyDE (concurrent) → search all probes
+  (concurrent, forced to `chunk_level=child`) → client-side RRF across probes → cross-encoder rerank
+  → MMR → parent substitution. **Rerank children, never parents** (parents blow the 512-token
+  cross-encoder window and get scored on their first quarter). **Substitute parents last.**
+- Two levels of RRF now exist: Phase 3 fuses dense+sparse *within* one query server-side; Phase 4's
+  `fusion.py` fuses *across* queries client-side. Qdrant cannot do the second — it never knows the N
+  calls were related.
+- `HybridRetriever._child_filter` **overrides** any caller-supplied `chunk_level` on purpose. Phase 16
+  must call the store directly to search summary nodes.
+- `search_many` uses `return_exceptions=True`: partial arm failure degrades and is counted in
+  `SearchOutcome.failed_queries`; **all** arms failing raises `RetrievalError(retryable=True)`.
+- Rerankers never raise — they fall back to the retrieval order with `rerank_score` left **None**, so
+  "skipped rerank" stays distinguishable from "reranked". Cross-encoder scores are **raw logits**
+  (unbounded, often negative); never show them as confidence or threshold them with a constant.
+- `ParentSubstituter` deduplicates parents (5 children → typically 2–3 parents), carries the best
+  child's `score`/`rerank_score` onto the parent, and enforces `MAX_CONTEXT_TOKENS` by **dropping
+  whole sources**, never truncating one.
+- **New settings**: `ENABLE_MULTI_QUERY`, `ENABLE_HYDE` (default false), `ENABLE_RERANKING`,
+  `ENABLE_MMR` (default false), `ENABLE_PARENT_SUBSTITUTION`, `RRF_K=60`, `MMR_LAMBDA=0.7`,
+  `MAX_CONTEXT_TOKENS=12000`, plus two `validate_runtime()` warnings.
+- **Corrected in Phase 1:** `RERANK_MODEL_NAME` is now `Xenova/ms-marco-MiniLM-L-6-v2`. The old
+  `cross-encoder/ms-marco-MiniLM-L-6-v2` is the sentence-transformers name and FastEmbed rejects it.
+  Fixed in both the settings block and `.env.example`.
+
+### FastEmbed rerankers (verified 2026-08-01)
+`from fastembed.rerank.cross_encoder import TextCrossEncoder`;
+`TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2")`; `list(encoder.rerank(query, docs))`
+→ `list[float]` of **logits** (e.g. `[-11.48, 5.47]`), one per document, order preserved. Also
+supports `rerank_pairs(pairs)`. Other registry entries: `Xenova/ms-marco-MiniLM-L-12-v2` (0.12 GB),
+`BAAI/bge-reranker-base` (1.04 GB), `jinaai/jina-reranker-v1-tiny-en`. Chosen over
+`sentence-transformers` `CrossEncoder` to avoid a PyTorch dependency for a 90 MB CPU model.
 
 ### FastEmbed (verified 2026-08-01)
 `TextEmbedding` (dense) and `SparseTextEmbedding` (sparse) expose `embed`, `query_embed`,
@@ -429,6 +482,31 @@ All 17 findings were valid or partially valid. Fixed in place:
 - Scope kept out on purpose, and stated in the doc: quantisation (no measurement yet to justify the
   recall trade — Phase 7 supplies it), and any retrieval policy (`chunk_level` filtering, parent
   substitution) which belongs to Phase 4.
+
+### Session 4 notes (Phase 4)
+
+- **Added one method to the frozen interface** rather than working around it. Parent substitution
+  needs a lookup by `chunk_id`, which is not a filterable field, so the honest options were
+  `fetch_by_ids` on `BaseVectorStore` or a duck-typed Qdrant-only call in Phase 4. Added the method
+  and patched Phase 1 + both Phase 3 stores in the same session, so nothing drifted. **Contrast with
+  Phase 2's `_parent_slot` offset**, where the cleaner fix (changing `make_chunk_id`'s signature)
+  was rejected because it rippled across four phases. The test is blast radius, not elegance: one
+  additive method touching three docs is cheap; a changed signature touching four phases is not.
+- Phase 4 came in at ~1,200 lines against a budget of 700 — again the 1.5–2× calibration. Two files
+  carry the excess (`parents.py` and `mmr.py`) and both are load-bearing. Nothing was added beyond
+  the brief.
+- **Two features ship OFF by default** (`ENABLE_HYDE`, `ENABLE_MMR`), and the doc argues both sides
+  rather than recommending them. On this corpus multi-query already closes most of the register gap,
+  and MMR hurts precise single-fact queries. Phase 7 decides. Resisting "add the technique because
+  it is impressive" is the scope control §4 demands.
+- **MMR re-embeds its candidates** (~30ms for 20) because `hybrid_search` returns payloads without
+  vectors. Documented as a deliberate cost with the two rejected alternatives (`with_vectors=True`
+  on every query; threading vectors through `RetrievalResult`, which would change a Phase 1 model).
+  Do not "fix" this later without re-reading that reasoning.
+- The §11 latency table is the most useful thing in the phase for later work: **the two LLM calls are
+  ~80% of retrieval latency and both happen before any search starts.** Everything Phases 3 and 4
+  built lives inside a ~200ms envelope. That is the justification for Phase 5's router node and
+  Phase 6's semantic cache, and it is the number to quote when asked what to optimise.
 
 ---
 

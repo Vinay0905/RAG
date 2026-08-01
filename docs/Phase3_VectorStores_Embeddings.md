@@ -339,6 +339,11 @@ class EmbeddingProviderBase(BaseEmbeddingProvider):
                 details={"inputs": len(texts), "vectors": len(vectors)},
             )
 
+    async def close(self) -> None:
+        """Release resources. Local providers hold nothing that needs closing;
+        network-backed providers override this."""
+        return None
+
 
 class LocalEmbeddingProvider(EmbeddingProviderBase):
     """A provider whose computation is CPU-bound and in-process.
@@ -366,6 +371,10 @@ class LocalEmbeddingProvider(EmbeddingProviderBase):
     def embed_query_sync(self, text: str) -> list[float]:
         """Blocking single-query embedding, with any query-side prefix applied."""
 
+    @abstractmethod
+    def embed_sparse_query_sync(self, text: str) -> dict[str, list]:
+        """Blocking sparse query embedding, with query-side weighting."""
+
     async def embed_dense(self, texts: list[str]) -> list[list[float]]:
         return await asyncio.to_thread(self.embed_dense_sync, texts)
 
@@ -374,6 +383,9 @@ class LocalEmbeddingProvider(EmbeddingProviderBase):
 
     async def embed_query(self, text: str) -> list[float]:
         return await asyncio.to_thread(self.embed_query_sync, text)
+
+    async def embed_sparse_query(self, text: str) -> dict[str, list]:
+        return await asyncio.to_thread(self.embed_sparse_query_sync, text)
 ```
 
 ### The Theory: why the interface is async when the work is not
@@ -659,10 +671,12 @@ class FastEmbedProvider(LocalEmbeddingProvider):
     def embed_sparse_query_sync(self, text: str) -> dict[str, list]:
         """BM25 sparse vector for a query.
 
-        Not part of `BaseEmbeddingProvider` — Phase 4 calls it directly on the
-        concrete provider. `query_embed` differs from `embed` on the sparse side
-        too: the query representation carries no term-frequency saturation,
-        because a query has no meaningful term frequencies.
+        `query_embed` differs from `embed` on the sparse side: the query
+        representation carries no term-frequency saturation and no length
+        normalisation, because neither is meaningful for a query. Using the
+        document-side embedding here would still return results — just
+        mis-weighted ones — which is why this is a distinct interface method
+        rather than something a caller is trusted to remember.
         """
         prepared = self._prepare([text])
         embeddings = list(self._sparse.query_embed(prepared[0]))
@@ -853,9 +867,17 @@ class OpenAIEmbeddingProvider(EmbeddingProviderBase):
         return vectors
 
     async def _embed_batch(self, group: list[str]) -> list[list[float]]:
-        """One API call, retried with exponential backoff on transient failures."""
+        """One API call, retried with exponential backoff on transient failures.
+
+        Two details that are easy to get wrong and were wrong in the first draft:
+        the sleep happens only *between* attempts, never after the last one (a
+        sleep before raising is pure added latency), and the exception raised on
+        exhaustion reflects what actually failed rather than always claiming a rate
+        limit.
+        """
         delay = 1.0
         last_error: Exception | None = None
+        rate_limited = False
 
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
@@ -873,6 +895,9 @@ class OpenAIEmbeddingProvider(EmbeddingProviderBase):
 
             except OpenAIRateLimitError as exc:
                 last_error = exc
+                rate_limited = True
+                if attempt == _MAX_ATTEMPTS:
+                    break
                 logger.warning(
                     "OpenAI rate limit; backing off",
                     extra={"attempt": attempt, "sleep_s": delay},
@@ -889,12 +914,27 @@ class OpenAIEmbeddingProvider(EmbeddingProviderBase):
                         "OpenAI rejected the embedding request",
                         details={"model": self.model, "status": status},
                     ) from exc
+                if attempt == _MAX_ATTEMPTS:
+                    break
                 await asyncio.sleep(delay)
                 delay *= 2
 
-        raise RateLimitError(
+        # The type must match the cause. Reporting a 500-loop as RateLimitError
+        # sends the caller off to check its quota, and Phase 5's retry logic reads
+        # the exception type to decide what to do next.
+        if rate_limited:
+            raise RateLimitError(
+                "OpenAI embedding rate-limited after retries",
+                details={"model": self.model, "attempts": _MAX_ATTEMPTS},
+            ) from last_error
+
+        raise EmbeddingError(
             "OpenAI embedding failed after retries",
-            details={"model": self.model, "attempts": _MAX_ATTEMPTS},
+            details={
+                "model": self.model,
+                "attempts": _MAX_ATTEMPTS,
+                "last_error": type(last_error).__name__ if last_error else "unknown",
+            },
         ) from last_error
 
     async def embed_query(self, text: str) -> list[float]:
@@ -926,6 +966,22 @@ class OpenAIEmbeddingProvider(EmbeddingProviderBase):
             }
             for embedding in model.embed(texts)
         ]
+
+    async def embed_sparse_query(self, text: str) -> dict[str, list]:
+        """Query-side BM25, also local. Delegates to the same model as
+        `embed_sparse` but through `query_embed`, which drops the document-side
+        term-frequency weighting."""
+        return await asyncio.to_thread(self._embed_sparse_query_sync, text)
+
+    def _embed_sparse_query_sync(self, text: str) -> dict[str, list]:
+        model = get_sparse_model(self._sparse_model_name)
+        embeddings = list(model.query_embed(text))
+        if not embeddings:
+            return {"indices": [], "values": []}
+        return {
+            "indices": [int(i) for i in embeddings[0].indices],
+            "values": [float(v) for v in embeddings[0].values],
+        }
 
     async def close(self) -> None:
         """Release the HTTP connection pool. Called from Phase 8's lifespan hook."""
@@ -987,10 +1043,22 @@ a 90 MB ONNX model.
 `@lru_cache` makes the provider a per-process singleton, which is the behaviour you want: the model
 is loaded once and shared.
 
-**Caching is safe here specifically because embedding providers hold no connection state.** Contrast
-this with the vector store factory in §10, which is deliberately *not* cached. The distinction is
-worth internalising: cache things that are expensive to build and stateless; never cache things that
-own a network connection bound to an event loop.
+**Caching is a real trade here, not a free win, and the first draft of this section overstated it.** I
+wrote that caching was safe "because embedding providers hold no connection state" — which is true of
+`FastEmbedProvider` and **false of `OpenAIEmbeddingProvider`**, which owns an `AsyncOpenAI` connection
+pool and has a `close()`. Two sentences apart from a class that contradicted it. The honest statement:
+
+- The **reason** to cache is model loading: 90 MB and several hundred milliseconds, per instance.
+- The **cost** is that a cached instance may own a connection pool, so something must close it. The
+  cache is per-process, so "something" is whatever owns the process — Phase 8's lifespan shutdown, or
+  the `finally` in `scripts/index_corpus.py`.
+- `BaseEmbeddingProvider.close()` therefore exists as a no-op default that the OpenAI provider
+  overrides. Callers close unconditionally and never branch on provider type.
+
+The vector store factory in §10 is still deliberately **not** cached, and the distinction is now
+narrower than I first claimed: a store's connection pool is bound to the event loop that uses it and
+its lifetime is per-request-context, whereas a provider's is per-process. Cache per-process things;
+construct per-context things.
 
 ```python
 from collections.abc import Callable
@@ -1027,9 +1095,10 @@ _BUILDERS: dict[str, Callable[[], BaseEmbeddingProvider]] = {
 def get_embedding_provider(name: str | None = None) -> BaseEmbeddingProvider:
     """Return the configured embedding provider, one instance per process.
 
-    Cached because building a provider loads a model. This is safe only because
-    providers hold no connection state — see `get_vector_store`, which is
-    deliberately not cached for exactly that reason.
+    Cached because building a provider loads a model. The cached instance may own
+    a connection pool (the OpenAI provider does), so whoever owns the process must
+    `await provider.close()` at shutdown — the base class provides a no-op default
+    so callers never branch on provider type.
 
     Tests that need a fresh instance call `get_embedding_provider.cache_clear()`.
 
@@ -1162,6 +1231,30 @@ class VectorStoreBase(BaseVectorStore):
                 details={"chunks": len(chunks), "dense": len(dense), "sparse": len(sparse)},
             )
 
+        # Duplicate IDs inside one batch are an upsert that overwrites itself. The
+        # store would report "wrote 256 points" and the collection would hold 254.
+        # Because the count returned is what the indexing pipeline logs and Phase 15
+        # audits against, this must be impossible rather than merely unlikely.
+        ids = [chunk.chunk_id for chunk in chunks]
+        if len(set(ids)) != len(ids):
+            duplicates = {i for i in ids if ids.count(i) > 1}
+            raise VectorStoreError(
+                "Duplicate chunk_ids within one batch would silently overwrite",
+                details={"duplicates": sorted(duplicates)[:5], "count": len(duplicates)},
+            )
+
+        for index, vector in enumerate(sparse):
+            if len(vector.get("indices", [])) != len(vector.get("values", [])):
+                raise VectorStoreError(
+                    "Sparse vector indices and values have different lengths",
+                    details={
+                        "index": index,
+                        "indices": len(vector.get("indices", [])),
+                        "values": len(vector.get("values", [])),
+                        "chunk_id": chunks[index].chunk_id,
+                    },
+                )
+
         if expected_dim is not None:
             for index, vector in enumerate(dense):
                 if len(vector) != expected_dim:
@@ -1275,7 +1368,7 @@ from src.core.exceptions import (
     VectorStoreError,
 )
 from src.core.logging import logger
-from src.core.models import RetrievalMethod, ScoredChunk
+from src.core.models import Chunk, RetrievalMethod, ScoredChunk
 from src.core.telemetry import telemetry
 
 from .base import (
@@ -1331,6 +1424,12 @@ class QdrantStore(VectorStoreBase):
         `operation` is a zero-argument callable returning a coroutine, not a
         coroutine — a coroutine can only be awaited once, so a retry would raise
         `RuntimeError: cannot reuse already awaited coroutine`.
+
+        Only *transient* failures are retried. A 401, a 404, or a malformed request
+        will fail identically three times, so retrying it just adds 1.5 seconds
+        before reporting the wrong thing: the first draft caught every exception and
+        marked all of them `retryable=True`, which would have told Phase 8 to retry
+        a bad API key.
         """
         delay = 0.5
         last: Exception | None = None
@@ -1339,6 +1438,24 @@ class QdrantStore(VectorStoreBase):
             try:
                 return await operation()
             except Exception as exc:
+                status = self._status_of(exc)
+
+                # A 4xx is a statement about the request, not about the server's
+                # health. Fail immediately, non-retryable, with the status visible.
+                if status is not None and 400 <= status < 500:
+                    raise VectorStoreError(
+                        f"Qdrant rejected the request: {description}",
+                        details={
+                            "collection": self.collection_name,
+                            "status": status,
+                            "hint": {
+                                401: "check the API key",
+                                403: "key lacks permission for this collection",
+                                404: "collection or point does not exist",
+                            }.get(status, "malformed request"),
+                        },
+                    ) from exc
+
                 last = exc
                 if attempt == _MAX_ATTEMPTS:
                     break
@@ -1358,6 +1475,17 @@ class QdrantStore(VectorStoreBase):
             details={"collection": self.collection_name, "attempts": _MAX_ATTEMPTS},
             retryable=True,
         ) from last
+
+    @staticmethod
+    def _status_of(exc: Exception) -> int | None:
+        """HTTP status from a Qdrant client exception, if it carries one.
+
+        `UnexpectedResponse` exposes `status_code`. Transport failures — refused
+        connection, timeout, DNS — carry none, and those are exactly the ones worth
+        retrying, so `None` correctly means "retry".
+        """
+        status = getattr(exc, "status_code", None)
+        return int(status) if isinstance(status, int) else None
 
     # ─── schema ────────────────────────────────────────────────────────────
 
@@ -1419,15 +1547,19 @@ class QdrantStore(VectorStoreBase):
         await self._ensure_payload_indexes()
 
     async def _verify_schema(self, vector_size: int) -> None:
-        """Best-effort check that an existing collection matches expectations.
+        """Check that an existing collection matches what this code expects.
 
-        Deliberately tolerant of introspection failures. The shape of
-        `CollectionInfo` has changed across client releases, and I cannot execute
-        anything here to confirm which shape you have. A schema check that crashes
-        on a nested attribute would be worse than one that warns — the
-        authoritative check remains the upsert itself, which Qdrant rejects on a
-        genuine mismatch. What we do NOT do is let a real dimension mismatch
-        through when we can see it.
+        The distinction that matters here — and that the first draft got wrong by
+        collapsing the two — is between **"I could not read the schema"** and
+        **"I read the schema and it is wrong."**
+
+        The first is tolerable: the nested shape of `CollectionInfo` has changed
+        across client releases and cannot be verified by running it here, so a
+        crash on an attribute access would be a self-inflicted outage. That warns.
+
+        The second is not tolerable. A missing named vector, a wrong dimension, or
+        a missing sparse field means every subsequent operation is wrong, and
+        "warning" is not a response to that. Those raise.
         """
         info = await self._retry(
             "get_collection", lambda: self._client.get_collection(self.collection_name)
@@ -1435,57 +1567,111 @@ class QdrantStore(VectorStoreBase):
 
         try:
             vectors = info.config.params.vectors
-            existing = vectors[DENSE_VECTOR_NAME].size  # type: ignore[index]
+            sparse_config = info.config.params.sparse_vectors or {}
+            readable = isinstance(vectors, dict)
         except Exception:
             logger.warning(
-                "Could not introspect collection vector config",
+                "Could not introspect collection config; skipping schema checks. "
+                "A genuine mismatch will surface on the first upsert.",
                 extra={"collection": self.collection_name},
             )
             return
 
-        if existing != vector_size:
+        if not readable:
+            # A single unnamed vector config. This collection was created by
+            # something else and hybrid search cannot work against it.
+            raise VectorStoreError(
+                "Collection has an unnamed vector config; hybrid search requires "
+                f"named vectors {DENSE_VECTOR_NAME!r} and {SPARSE_VECTOR_NAME!r}",
+                details={"collection": self.collection_name},
+            )
+
+        if DENSE_VECTOR_NAME not in vectors:
+            raise VectorStoreError(
+                "Collection is missing the expected dense vector field",
+                details={
+                    "collection": self.collection_name,
+                    "expected": DENSE_VECTOR_NAME,
+                    "found": sorted(vectors),
+                },
+            )
+
+        params = vectors[DENSE_VECTOR_NAME]
+
+        if params.size != vector_size:
             raise DimensionMismatchError(
                 "Existing collection has a different vector size",
                 details={
                     "collection": self.collection_name,
-                    "existing": existing,
+                    "existing": params.size,
                     "requested": vector_size,
                 },
             )
 
-        try:
-            sparse = info.config.params.sparse_vectors or {}
-            modifier = getattr(sparse.get(SPARSE_VECTOR_NAME), "modifier", None)
-            if modifier != models.Modifier.IDF:
-                logger.warning(
-                    "Sparse vector field has no IDF modifier — BM25 scoring will "
-                    "ignore term rarity. Recreate the collection to fix.",
-                    extra={"collection": self.collection_name, "modifier": str(modifier)},
-                )
-        except Exception:
-            logger.debug("Could not introspect sparse vector config")
+        if params.distance != models.Distance.COSINE:
+            # Normalised embeddings scored by dot product or Euclidean distance
+            # produce a different ranking. Results would still come back.
+            raise VectorStoreError(
+                "Collection uses a different distance metric",
+                details={
+                    "collection": self.collection_name,
+                    "existing": str(params.distance),
+                    "expected": "Cosine",
+                },
+            )
+
+        if SPARSE_VECTOR_NAME not in sparse_config:
+            raise VectorStoreError(
+                "Collection has no sparse vector field; retrieval would be "
+                "dense-only while claiming to be hybrid",
+                details={
+                    "collection": self.collection_name,
+                    "expected": SPARSE_VECTOR_NAME,
+                    "found": sorted(sparse_config),
+                },
+            )
+
+        modifier = getattr(sparse_config[SPARSE_VECTOR_NAME], "modifier", None)
+        if modifier != models.Modifier.IDF:
+            # Not fatal — search works — but silently wrong, so it is loud.
+            logger.error(
+                "Sparse vector field has no IDF modifier: BM25 scoring will ignore "
+                "term rarity. This cannot be altered in place; recreate the "
+                "collection and re-index.",
+                extra={"collection": self.collection_name, "modifier": str(modifier)},
+            )
 
     async def _ensure_payload_indexes(self) -> None:
-        """Create the payload indexes. Existing indexes are left alone.
+        """Create any payload index that is missing. Failures are NOT suppressed.
 
-        Qdrant returns an error when the index already exists, and there is no
-        `create_if_missing`. Swallowing the error is the accepted pattern — but
-        note it is swallowed only here, where "already exists" is the expected
-        outcome on every startup after the first.
+        The obvious implementation wraps `create_payload_index` in
+        `try/except Exception: pass`, on the theory that the error means "already
+        exists". That was the first draft, and it is the exact anti-pattern this
+        project keeps warning about: a bad API key, a network failure, or an invalid
+        schema would all be swallowed, `initialize()` would report success, and the
+        collection would run without the `doc_id` index — turning every
+        delete-before-upsert into a full scan, silently.
+
+        So: ask what already exists, create only what does not, and let anything
+        that goes wrong raise. `_retry` classifies the failure.
         """
+        info = await self._retry(
+            "get_collection", lambda: self._client.get_collection(self.collection_name)
+        )
+        existing = set(info.payload_schema or {})
+
         for field, kind in PAYLOAD_INDEX_FIELDS:
-            try:
-                await self._client.create_payload_index(
+            if field in existing:
+                continue
+            await self._retry(
+                f"create_payload_index[{field}]",
+                lambda field=field, kind=kind: self._client.create_payload_index(
                     collection_name=self.collection_name,
                     field_name=field,
                     field_schema=_SCHEMA_MAP[kind],
-                )
-                logger.info("Created payload index", extra={"field": field, "kind": kind})
-            except Exception as exc:
-                logger.debug(
-                    "Payload index not created (probably already present)",
-                    extra={"field": field, "error": type(exc).__name__},
-                )
+                ),
+            )
+            logger.info("Created payload index", extra={"field": field, "kind": kind})
 
     async def set_bulk_mode(self, enabled: bool) -> None:
         """Defer or resume HNSW graph construction.
@@ -1558,16 +1744,48 @@ class QdrantStore(VectorStoreBase):
 
         return len(points)
 
+    async def fetch_by_ids(self, ids: Sequence[str]) -> list[Chunk]:
+        """Retrieve points by ID, with no vector search.
+
+        `chunk_id` is not a filterable field — the payload indexes cover `doc_id`,
+        `chunk_level`, `year`, and `section_title` — so a direct ID lookup is the
+        only way to fetch a known point. Phase 4's parent substitution is the first
+        caller; Phases 13 and 16 walk chunk references the same way.
+
+        Missing IDs are skipped rather than reported. Phase 4 treats an absent
+        parent as "use the child", which is a correct degradation, so an error here
+        would take down a request over a stale pointer.
+
+        `with_vectors=False`: the caller wants text and metadata. Vectors would add
+        384 floats per point to the response for nothing.
+        """
+        if not ids:
+            return []
+
+        records = await self._retry(
+            "retrieve",
+            lambda: self._client.retrieve(
+                collection_name=self.collection_name,
+                ids=list(ids),
+                with_payload=True,
+                with_vectors=False,
+            ),
+        )
+        return [Chunk.from_payload(record.payload) for record in records if record.payload]
+
     async def delete_by_doc_id(self, doc_id: str) -> int:
         """Remove every chunk of one document. Returns the count deleted."""
         return await self.delete_by_doc_ids([doc_id])
 
     async def delete_by_doc_ids(self, doc_ids: Sequence[str]) -> int:
-        """Batch form of `delete_by_doc_id` — one round trip for many documents.
+        """Batch delete — one round trip for many documents.
 
-        The interface only requires the single-document version, but a batch of
-        256 chunks typically spans dozens of documents, and issuing one delete per
-        document would double the round trips of the whole ingestion run.
+        This is the abstract method on `BaseVectorStore` and `delete_by_doc_id` is
+        the wrapper, not the other way round. The batch form is primary because it
+        is what the caller needs: a 256-chunk batch spans dozens of documents, and
+        one request per document would double the round trips of an entire
+        ingestion run. (The first draft had this backwards, which meant
+        `IndexingPipeline` called a method its declared type did not have.)
 
         Returns the number of points that matched, obtained with a separate exact
         count because Qdrant's delete does not report one. That count is only fast
@@ -1835,9 +2053,10 @@ match zero points, because those chunks are all `standalone`.
 no HNSW graph, so every search is an exact brute-force scan. `await store.set_bulk_mode(False)` and
 wait for the optimiser; `get_collection` reports status `yellow` while it works and `green` when done.
 
-**Deletes take minutes.** The `doc_id` payload index is missing. `_ensure_payload_indexes` swallows
-creation errors by design, so an index that failed to create for a real reason is only visible in the
-debug log. Check with `get_collection(...).payload_schema`.
+**Deletes take minutes.** The `doc_id` payload index is missing, so deleting by filter is a full scan.
+`_ensure_payload_indexes` raises rather than suppressing, so this should be impossible on a collection
+this code created — but a collection created by an older script or a notebook will have no indexes.
+Confirm with `get_collection(...).payload_schema`.
 
 **`RuntimeError: cannot reuse already awaited coroutine` inside `_retry`.** You passed
 `self._client.count(...)` instead of `lambda: self._client.count(...)`. A coroutine object is
@@ -1886,7 +2105,7 @@ import chromadb
 from config.settings import settings
 from src.core.exceptions import VectorStoreError
 from src.core.logging import logger
-from src.core.models import RetrievalMethod, ScoredChunk
+from src.core.models import Chunk, RetrievalMethod, ScoredChunk
 
 from .base import VectorStoreBase
 
@@ -1960,7 +2179,7 @@ class ChromaStore(VectorStoreBase):
         filters: dict[str, Any] | None = None,
     ) -> list[ScoredChunk]:
         """Dense-only search. The name is the interface's, not a description."""
-        where = {k: v for k, v in (filters or {}).items() if not isinstance(v, (dict, list))}
+        where = self._build_where(filters)
 
         try:
             response = await asyncio.to_thread(
@@ -1984,6 +2203,46 @@ class ChromaStore(VectorStoreBase):
         # downstream code uses.
         rows = [(meta, 1.0 - float(dist)) for meta, dist in zip(metadatas, distances, strict=True)]
         return self._to_scored_chunks(rows, method=RetrievalMethod.DENSE)
+
+    @staticmethod
+    def _build_where(filters: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Translate the project's filter dict into a Chroma `where` clause.
+
+        Raises on anything it cannot express. The first draft silently dropped
+        range and list filters, which is the same failure the Qdrant store raises
+        on and for the same reason: a filter that quietly does not apply returns
+        MORE data than asked for. Under Phase 11, where filters carry tenant
+        authorization, "returned everything" is a data breach and not a bug report.
+
+        Chroma does support `$gte`/`$lte`/`$in` operators, so the honest
+        alternative to raising is implementing them. That is left undone
+        deliberately — this store exists to prove the abstraction and to run tests,
+        and unused translation code is untested translation code.
+
+        Raises:
+            VectorStoreError: a filter shape this store cannot honour.
+        """
+        if not filters:
+            return None
+
+        where: dict[str, Any] = {}
+        for key, value in filters.items():
+            if isinstance(value, (dict, list, tuple, set)):
+                raise VectorStoreError(
+                    "ChromaStore supports only exact-match filters",
+                    details={"field": key, "shape": type(value).__name__},
+                )
+            where[key] = value
+        return where
+
+    async def fetch_by_ids(self, ids: Sequence[str]) -> list[Chunk]:
+        """Retrieve points by ID. Missing IDs are skipped."""
+        if not ids:
+            return []
+        response = await asyncio.to_thread(
+            self._collection.get, ids=list(ids), include=["metadatas"]
+        )
+        return [Chunk.from_payload(meta) for meta in (response.get("metadatas") or []) if meta]
 
     async def delete_by_doc_id(self, doc_id: str) -> int:
         existing = await asyncio.to_thread(self._collection.get, where={"doc_id": doc_id})
@@ -2138,6 +2397,8 @@ documents. Failing fast is correct.
 
 ```python
 import asyncio
+import threading
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from config.settings import settings
@@ -2188,6 +2449,11 @@ class IndexingPipeline:
         self.bulk_mode = bulk_mode
         self.stats = IndexingStats()
 
+        # Serialises `next(generator)` against `generator.close()`. Both run in
+        # worker threads, and a generator cannot do two things at once — see the
+        # cancellation discussion below.
+        self._generator_lock = threading.Lock()
+
     @telemetry.measure_async("indexing.run")
     async def run(
         self,
@@ -2198,7 +2464,13 @@ class IndexingPipeline:
         """Ingest, embed, and store the corpus. Returns storage-side statistics."""
         new_request_id()
 
-        await self.store.initialize(self.embedder.dense_dimensions)
+        # `dense_dimensions` loads the ONNX model and runs a probe embedding on
+        # first access — several hundred milliseconds of blocking CPU work. Inside
+        # a coroutine that stalls the whole event loop, which matters when Phase 8
+        # triggers indexing from a live API process.
+        dimensions = await asyncio.to_thread(lambda: self.embedder.dense_dimensions)
+
+        await self.store.initialize(dimensions)
         await self._set_bulk_mode(True)
 
         batches = self.ingestion.run(limit=limit, years=years, resume=resume)
@@ -2208,22 +2480,47 @@ class IndexingPipeline:
                 # instead of raising StopIteration. A StopIteration escaping into
                 # a coroutine frame becomes "RuntimeError: coroutine raised
                 # StopIteration" (PEP 479), which points nowhere useful.
-                batch = await asyncio.to_thread(next, batches, None)
+                batch = await asyncio.to_thread(self._pull, batches)
                 if batch is None:
                     break
                 await self._index_batch(batch)
         finally:
-            # Unwinds Phase 2's `with mp.Pool(...)` and checkpoint context
-            # managers at their current yield point. Without this, an early exit
-            # leaves worker processes alive until garbage collection.
-            batches.close()
-            await self._set_bulk_mode(False)
+            # Both of these must happen even on cancellation, and the order is
+            # deliberate: stop producing work before changing collection settings.
+            await asyncio.to_thread(self._close, batches)
+            await self._restore_bulk_mode()
 
         logger.info(
             "Indexing complete",
             extra={**self.stats.summary(), **self.ingestion.stats.summary()},
         )
         return self.stats
+
+    # ─── the sync-generator bridge ─────────────────────────────────────────
+
+    def _pull(self, batches: Iterator[ChunkBatch]) -> ChunkBatch | None:
+        """Advance the ingestion generator. Runs in a worker thread."""
+        with self._generator_lock:
+            return next(batches, None)
+
+    def _close(self, batches: Iterator[ChunkBatch]) -> None:
+        """Close the generator, waiting for any in-flight `_pull` to finish.
+
+        This lock is not decoration. `asyncio.to_thread` cannot be cancelled — if
+        the surrounding task is cancelled while a pull is running, `await` returns
+        immediately but **the worker thread keeps going**, still inside
+        `next(batches)`. The `finally` block then runs `close()` concurrently, and
+        a generator cannot be advanced and closed at the same time:
+        `ValueError: generator already executing`. Worse, the close fails, so
+        Phase 2's `with mp.Pool(...)` never unwinds and the worker processes
+        survive.
+
+        The lock makes `close()` wait for the pull to finish. Cancellation is
+        therefore not instant — you wait out one batch — but it is correct, and it
+        runs in a thread so the event loop stays free while waiting.
+        """
+        with self._generator_lock:
+            batches.close()
 
     async def _index_batch(self, batch: ChunkBatch) -> None:
         """Embed and store one batch, then commit or roll back the checkpoint."""
@@ -2282,11 +2579,14 @@ class IndexingPipeline:
         )
 
     async def _set_bulk_mode(self, enabled: bool) -> None:
-        """Toggle deferred HNSW construction, if the store supports it.
+        """Enter deferred-HNSW mode, if the store supports it.
 
         Duck-typed rather than added to `BaseVectorStore`: it is a Qdrant-specific
         optimisation, and putting a vendor performance knob in the shared
         interface would force every future store to implement a no-op.
+
+        Failing to ENTER bulk mode is harmless — the run is slower. Failing to
+        LEAVE it is not, which is why the two directions are separate methods.
         """
         if not self.bulk_mode:
             return
@@ -2296,8 +2596,46 @@ class IndexingPipeline:
         try:
             await setter(enabled)
         except RAGException as exc:
-            # Never let a performance optimisation abort a nine-hour run.
-            logger.warning("Could not toggle bulk mode", extra={"error": str(exc)})
+            logger.warning(
+                "Could not enter bulk indexing mode; continuing without it",
+                extra={"error": str(exc)},
+            )
+
+    async def _restore_bulk_mode(self) -> None:
+        """Leave bulk mode. Retries, and raises if it cannot.
+
+        This is the asymmetry the first draft got wrong: it swallowed failures in
+        both directions. But a collection left at `indexing_threshold=0` has no
+        HNSW graph, so every subsequent search is an exact brute-force scan — at 39
+        million points, seconds per query. The run would report success and leave
+        the system unusably slow, with nothing pointing at the cause.
+
+        So this one is loud. If the last thing standing between you and a working
+        index fails, you need to know at the end of the run, not next week.
+        """
+        if not self.bulk_mode:
+            return
+        setter = getattr(self.store, "set_bulk_mode", None)
+        if setter is None:
+            return
+
+        for attempt in (1, 2, 3):
+            try:
+                await setter(False)
+                return
+            except RAGException as exc:
+                logger.warning(
+                    "Failed to restore indexing threshold",
+                    extra={"attempt": attempt, "error": str(exc)},
+                )
+                await asyncio.sleep(2.0 * attempt)
+
+        raise RAGException(
+            "Indexing finished but the collection is still in bulk mode. Every "
+            "search will be a brute-force scan until the indexing threshold is "
+            "restored. Run store.set_bulk_mode(False) manually.",
+            details={"collection": getattr(self.store, "collection_name", "unknown")},
+        )
 ```
 
 ### The entry point
@@ -2339,7 +2677,11 @@ async def main(args: argparse.Namespace) -> None:
         logger.info("Done", extra=stats.summary())
     finally:
         # The factory does not cache stores, so this instance is ours to close.
+        # The embedder IS cached, but the cache is per-process and this process is
+        # ending — and the OpenAI provider owns a connection pool. `close()` is a
+        # no-op on local providers, so this is unconditional by design.
         await store.close()
+        await embedder.close()
 
 
 if __name__ == "__main__":
@@ -2393,6 +2735,7 @@ Creates and destroys a temporary collection. Never writes to QDRANT_COLLECTION.
 """
 import asyncio
 import sys
+import uuid
 
 from src.core.models import Chunk, ChunkLevel
 from src.core.utils import make_chunk_id, make_doc_id, make_section_id
@@ -2400,7 +2743,10 @@ from src.embeddings.fastembed_provider import FastEmbedProvider
 from src.vectorstores.base import DENSE_VECTOR_NAME, SPARSE_VECTOR_NAME
 from src.vectorstores.qdrant_store import QdrantStore
 
-TEMP_COLLECTION = "verify_phase3_tmp"
+#: Unique per run, because the teardown deletes this collection unconditionally.
+#: A fixed name would destroy a real collection the moment someone happened to use
+#: it — a verification script must not be capable of data loss.
+TEMP_COLLECTION = f"verify_phase3_{uuid.uuid4().hex[:8]}"
 
 DOC_ID = make_doc_id("data/contracts/2003/verify.txt")
 SECTION_ID = make_section_id(DOC_ID, "Termination", 0)
@@ -2415,13 +2761,21 @@ TEXTS = [
 
 
 def make_chunks(count: int, level: ChunkLevel = ChunkLevel.CHILD) -> list[Chunk]:
+    """Synthetic chunks for one document.
+
+    Parents are offset by 1_000_000 exactly as Phase 2's `_parent_slot` does.
+    Without the offset, parent index 0 and child index 0 derive the SAME
+    `chunk_id`, so upserting parents overwrites the children — which would make
+    `check_filters` pass while testing nothing.
+    """
+    offset = 1_000_000 if level == ChunkLevel.PARENT else 0
     return [
         Chunk(
-            chunk_id=make_chunk_id(DOC_ID, SECTION_ID, i),
+            chunk_id=make_chunk_id(DOC_ID, SECTION_ID, i + offset),
             doc_id=DOC_ID,
             section_id=SECTION_ID,
             text=TEXTS[i % len(TEXTS)],
-            chunk_index=i,
+            chunk_index=i + offset,
             token_count=20,
             contract_name="Verification Agreement",
             file_name="verify.txt",
@@ -2433,7 +2787,9 @@ def make_chunks(count: int, level: ChunkLevel = ChunkLevel.CHILD) -> list[Chunk]
     ]
 
 
-async def embed(provider: FastEmbedProvider, chunks: list[Chunk]):
+async def embed(
+    provider: FastEmbedProvider, chunks: list[Chunk]
+) -> tuple[list[list[float]], list[dict[str, list]]]:
     texts = [c.text for c in chunks]
     dense = await provider.embed_dense(texts)
     sparse = await provider.embed_sparse(texts)
@@ -2455,6 +2811,19 @@ def check_embeddings(provider: FastEmbedProvider) -> None:
 
     query = provider.embed_query_sync("termination notice period")
     assert len(query) == dims, "query and document vectors must share a width"
+
+    # The query-side sparse vector must differ from the document-side one for the
+    # same text: BM25's document representation applies term-frequency saturation
+    # and length normalisation, and a query has neither. If these are identical,
+    # `embed_sparse_query` is wired to the wrong method and lexical scoring will be
+    # subtly mis-weighted with no error anywhere.
+    doc_side = provider.embed_sparse_sync([TEXTS[0]])[0]
+    query_side = provider.embed_sparse_query_sync(TEXTS[0])
+    assert query_side["indices"], "query-side sparse vector is empty"
+    assert doc_side["values"] != query_side["values"], (
+        "query-side and document-side BM25 produced identical weights — "
+        "embed_sparse_query is probably delegating to embed_sparse"
+    )
 
     # Asymmetric models produce a DIFFERENT vector for the same text via
     # query_embed than via passage_embed. If these are identical, either the
@@ -2624,10 +2993,94 @@ async def check_lexical_advantage(store: QdrantStore, provider: FastEmbedProvide
     print("✓ lexical: a verbatim phrase ranks first under RRF fusion")
 
 
+async def check_transaction(provider: FastEmbedProvider) -> None:
+    """The two-phase commit contract, tested with stubs and no Qdrant.
+
+    This is the most important guarantee in the phase and the easiest to break
+    silently: if the pipeline commits when storage failed, documents are marked
+    indexed forever and no error is ever raised. Testing it needs no real store —
+    only something that fails on demand and something that counts commits.
+    """
+    from src.core.models import Chunk as _Chunk
+    from src.ingestion.pipeline import ChunkBatch
+    from src.pipelines.indexing_pipeline import IndexingPipeline
+
+    class FakeIngestion:
+        def __init__(self, batches: list[ChunkBatch]) -> None:
+            self._batches = batches
+            self.commits = 0
+            self.rollbacks = 0
+            self.closed = False
+            self.stats = type("S", (), {"summary": lambda self: {}})()
+
+        def run(self, **_: object):
+            try:
+                yield from self._batches
+            finally:
+                self.closed = True
+
+        def commit(self) -> int:
+            self.commits += 1
+            return 1
+
+        def rollback(self) -> int:
+            self.rollbacks += 1
+            return 1
+
+    class FailingStore:
+        def __init__(self, fail_on: int) -> None:
+            self.fail_on = fail_on
+            self.upserts = 0
+            self.collection_name = "fake"
+
+        async def initialize(self, vector_size: int) -> None:
+            return None
+
+        async def delete_by_doc_ids(self, doc_ids) -> int:
+            return 0
+
+        async def upsert_points(self, chunks, dense, sparse) -> int:
+            self.upserts += 1
+            if self.upserts == self.fail_on:
+                raise RuntimeError("simulated Qdrant outage")
+            return len(chunks)
+
+    chunks = make_chunks(2)
+    batches = [ChunkBatch(chunks=chunks, document_count=1) for _ in range(3)]
+
+    # Happy path: one commit per batch, no rollbacks.
+    ingestion = FakeIngestion(list(batches))
+    pipeline = IndexingPipeline(ingestion, provider, FailingStore(fail_on=0), bulk_mode=False)
+    await pipeline.run()
+    assert ingestion.commits == 3, f"expected 3 commits, got {ingestion.commits}"
+    assert ingestion.rollbacks == 0, "committed batches should not roll back"
+    assert ingestion.closed, "the ingestion generator was not closed"
+
+    # Failure path: the failing batch rolls back and the run aborts.
+    ingestion = FakeIngestion(list(batches))
+    pipeline = IndexingPipeline(ingestion, provider, FailingStore(fail_on=2), bulk_mode=False)
+    try:
+        await pipeline.run()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a storage failure must propagate, not be swallowed")
+
+    assert ingestion.commits == 1, (
+        f"only the first batch stored successfully, so commits must be 1, "
+        f"got {ingestion.commits}"
+    )
+    assert ingestion.rollbacks == 1, f"expected 1 rollback, got {ingestion.rollbacks}"
+    assert ingestion.closed, "the generator must be closed even when a batch fails"
+
+    print("✓ transaction: commit only on success, rollback on failure, generator closed")
+
+
 async def main() -> int:
     provider = FastEmbedProvider()
     provider.warmup()
     check_embeddings(provider)
+    await check_transaction(provider)
 
     store = QdrantStore(collection_name=TEMP_COLLECTION)
     try:

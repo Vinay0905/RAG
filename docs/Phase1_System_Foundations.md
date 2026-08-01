@@ -477,7 +477,7 @@ OPENAI_API_KEY=sk_replace_me_optional
 DENSE_MODEL_NAME=BAAI/bge-small-en-v1.5
 DENSE_VECTOR_SIZE=384
 SPARSE_MODEL_NAME=Qdrant/bm25
-RERANK_MODEL_NAME=cross-encoder/ms-marco-MiniLM-L-6-v2
+RERANK_MODEL_NAME=Xenova/ms-marco-MiniLM-L-6-v2
 
 # ─── LLM models ────────────────────────────────────────────────────────────
 # Groq retires model IDs on a few months' notice. Verify against
@@ -627,7 +627,11 @@ class Settings(BaseSettings):
     DENSE_MODEL_NAME: str = Field(default="BAAI/bge-small-en-v1.5")
     DENSE_VECTOR_SIZE: int = Field(default=384, ge=1)
     SPARSE_MODEL_NAME: str = Field(default="Qdrant/bm25")
-    RERANK_MODEL_NAME: str = Field(default="cross-encoder/ms-marco-MiniLM-L-6-v2")
+    # FastEmbed's ONNX registry name for the ms-marco MiniLM cross-encoder. NOT
+    # "cross-encoder/ms-marco-MiniLM-L-6-v2" — same weights, but that is the
+    # sentence-transformers name and FastEmbed rejects it. Phase 4 uses FastEmbed
+    # to avoid pulling PyTorch in for a 90 MB CPU model.
+    RERANK_MODEL_NAME: str = Field(default="Xenova/ms-marco-MiniLM-L-6-v2")
 
     EXPANSION_MODEL: str = Field(default="openai/gpt-oss-20b")
     GENERATION_MODEL: str = Field(default="openai/gpt-oss-120b")
@@ -1491,7 +1495,7 @@ system's seams without reading any implementation.
 
 ```python
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from src.core.models import Chunk, Document, ScoredChunk, Section
@@ -1571,6 +1575,27 @@ class BaseEmbeddingProvider(ABC):
         instruction prefix for queries versus documents — `bge` is one of them.
         """
 
+    @abstractmethod
+    async def embed_sparse_query(self, text: str) -> dict[str, list]:
+        """Sparse vector for a single query.
+
+        Separate from `embed_sparse` for the same reason `embed_query` is separate
+        from `embed_dense`, and it is not a nicety: BM25's document
+        representation applies term-frequency saturation and length
+        normalisation, neither of which is meaningful for a query. Using the
+        document-side embedding for a query produces a subtly mis-weighted vector
+        that still returns results, so the mistake is invisible.
+        """
+
+    async def close(self) -> None:
+        """Release any resources the provider holds. Default is a no-op.
+
+        Not abstract because local providers hold only an ONNX session, which the
+        interpreter reclaims. Network-backed providers own an HTTP connection pool
+        and must override this — see the lifecycle note on the Phase 3 factory.
+        """
+        return None
+
     def embed_dense_sync(self, texts: list[str]) -> list[list[float]]:
         """Blocking dense embedding, for use inside multiprocessing workers.
 
@@ -1610,15 +1635,38 @@ class BaseVectorStore(ABC):
         """
 
     @abstractmethod
-    async def delete_by_doc_id(self, doc_id: str) -> int:
-        """Remove every chunk belonging to one document. Returns the count deleted.
+    async def fetch_by_ids(self, ids: Sequence[str]) -> list[Chunk]:
+        """Retrieve specific points by ID, with no vector search.
 
-        Called immediately before re-upserting a document. Deterministic chunk IDs
-        make an *unchanged* re-ingest idempotent, but they cannot remove chunks that
-        no longer exist — if a document's chunk count shrinks, or its section titles
+        Needed because `chunk_id` is not a filterable field — the payload indexes
+        cover `doc_id`, `chunk_level`, `year`, and `section_title`. Phase 4's
+        parent substitution looks parents up by ID, and Phases 13 and 16 walk
+        chunk references the same way.
+
+        Returns only the chunks that exist. A missing ID is not an error: Phase 4
+        treats an absent parent as "use the child", which is a correct degradation
+        rather than a failure.
+        """
+
+    @abstractmethod
+    async def delete_by_doc_ids(self, doc_ids: Sequence[str]) -> int:
+        """Remove every chunk of every listed document. Returns the count deleted.
+
+        Called immediately before re-upserting. Deterministic chunk IDs make an
+        *unchanged* re-ingest idempotent, but they cannot remove chunks that no
+        longer exist — if a document's chunk count shrinks, or its section titles
         change, the old points would otherwise linger as stale ghosts. See the
         discussion in `utils.py` below.
+
+        The batch form is the abstract one because that is what the caller
+        actually needs: a 256-chunk batch spans dozens of documents, and one
+        request per document would double the round trips of an entire ingestion
+        run. A store that can only delete singly implements this as a loop.
         """
+
+    async def delete_by_doc_id(self, doc_id: str) -> int:
+        """Single-document convenience wrapper. Not abstract — it delegates."""
+        return await self.delete_by_doc_ids([doc_id])
 
     @abstractmethod
     async def count(self) -> int:
