@@ -61,9 +61,21 @@ here is what they mean and how to read them:
 
 ### The rule about checkpoints
 
-**Never start phase N+1 until phase N's checkpoint passes.** In a layered system, a broken
-foundation does not announce itself — it produces a confusing error four phases later, in a file
-that is completely correct. Every hour you spend debugging out of order is an hour wasted.
+Each phase ends with a verification script. In a layered system a broken foundation does not announce
+itself — it produces a confusing error four phases later, in a file that is completely correct. So the
+ideal is: **do not start phase N+1 until phase N's verification passes.**
+
+That ideal assumes you can run the code. This project is being written on a machine without the
+corpus and without the Docker services, so verification is **deferred**: each phase's script is
+written out precisely and saved under `scripts/`, to be run later on the machine that has the data.
+The phase guides label these sections *Verification (deferred)* rather than *Checkpoint* to make the
+distinction explicit.
+
+The practical consequence is that you will type several phases before running any of them, and errors
+will therefore surface in batches rather than one at a time. Two habits make that survivable. Run the
+verification scripts in phase order when you do get to a capable machine, since a Phase 1 failure will
+manifest as nonsense in Phase 4. And read each *Failure Modes* section **before** typing the file
+rather than after, because it is the only early-warning system available to you in this mode.
 
 ---
 
@@ -250,7 +262,7 @@ The line estimates are for Python you type, excluding blank lines and the docs t
 
 | # | Phase | What you learn | Est. LOC | Depends on |
 | :-- | :--- | :--- | ---: | :--- |
-| 1 | System Foundations | Pydantic models, ABCs, exception design, structured logging | 550 | — |
+| 1 | System Foundations | Pydantic models, ABCs, exception design, structured logging | 1,000 | — |
 | 2 | Ingestion at Scale | Generators, multiprocessing, checkpointing, dead-letter queues | 1,000 | 1 |
 | 3 | Embeddings & Vector Stores | Dense vs sparse vectors, adapter + factory patterns, Qdrant | 800 | 1 |
 | 4 | Hybrid Retrieval & Reranking | BM25, RRF, HyDE, cross-encoders, MMR diversity | 700 | 1, 3 |
@@ -260,7 +272,7 @@ The line estimates are for Python you type, excluding blank lines and the docs t
 | 8 | FastAPI Async Server | Dependency injection, SSE streaming, WebSockets, lifespan | 600 | 1, 5 |
 | 9 | CLI & Web Dashboard | Typer, Rich, vanilla JS streaming client | 650 | 8 |
 | 10 | Testing & Verification | Fixtures, mocking, async tests, integration + e2e layers | 1,100 | all |
-| | **Part I subtotal** | | **7,600** | |
+| | **Part I subtotal** | | **8,050** | |
 
 ### Part II — The Hard Problems
 
@@ -275,10 +287,19 @@ Each of these maps directly to a numbered failure in `future_ideas_problems.md`.
 | 15 | Embedding Drift & Shadow Indexing | #5 Migrating models without downtime | 550 | 3 |
 | 16 | RAPTOR Summary Trees | #6 Whole-document summarisation | 650 | 2, 3 |
 | | **Part II subtotal** | | **3,900** | |
-| | **PROJECT TOTAL** | | **≈ 11,500** | |
+| | **PROJECT TOTAL** | | **≈ 11,950** | |
 
 The budget overshoots 10,000 deliberately. Estimates always run optimistic, and you should have
 room to cut Phase 9's web UI or trim Chroma support without falling short of the target.
+
+**A calibration note, recorded after Phase 1 was written.** Phase 1 was originally budgeted at 550
+lines and came in at roughly 1,000 — the table above has been corrected. The cause is that
+production-density code is dominated not by logic but by validators, docstrings, and type
+annotations, which estimates habitually omit. Expect the remaining phases to run **1.5× to 2× their
+stated numbers** for the same reason, putting the realistic project total somewhere around 13,000 to
+15,000 lines. That is comfortably past the 10,000 target, which means **the goal is now scope
+control, not scope growth.** If a phase starts ballooning well past its budget, that is a signal to
+cut features rather than a licence to keep going.
 
 ### The critical path
 
@@ -355,9 +376,20 @@ chunk = {"chunk_id": "...", "chunk_text": "...", "section": "..."}
 print(chunk["chunk_txt"])          # KeyError at runtime, in production
 
 # ✅ Our way — validated at construction, autocompleted in the editor
-chunk = Chunk(chunk_id="...", text="...", section="...")
+chunk = Chunk(
+    chunk_id=make_chunk_id(doc_id, section_id, 0),
+    doc_id=doc_id,
+    section_id=section_id,
+    text="Either party may terminate on 30 days notice.",
+    chunk_index=0,
+    token_count=count_tokens(text),
+    section_title="SECTION 1.01",
+)
 print(chunk.txt)                   # caught by the type checker, before you run
 ```
+
+The exact field list is defined in Phase 1's `src/core/models.py` — that file is the authority, and
+this snippet must match it.
 
 The payoff is threefold: errors surface at the boundary where bad data enters rather than deep
 inside consuming code; your editor can autocomplete every field; and FastAPI in Phase 8 generates
@@ -371,19 +403,32 @@ Dicts are permitted only for genuinely dynamic key-value data.
 Every I/O-bound function is `async def`. That means all vector store calls, all LLM calls, all cache
 calls, and every graph node.
 
-The exception is **CPU-bound work**, which gains nothing from `async` and will block the event loop
-if you naively await it. Embedding generation and cross-encoder reranking are CPU-bound. We handle
-them by offloading to a thread:
+The complication is **CPU-bound work**, which gains nothing from `async` and will block the event
+loop if you call it directly inside a coroutine. Cross-encoder reranking and local embedding
+generation are both CPU-bound.
+
+The resolution is important, and it is a rule about *where* the thread offload lives rather than
+about which signatures are async. **All interfaces stay async. CPU-bound implementations offload
+internally.**
 
 ```python
-# ❌ Blocks the entire event loop for ~200ms — every other request stalls
-def rerank(self, query: str, docs: list[Chunk]) -> list[Chunk]:
+# ❌ Interface is sync, so a network-backed implementation cannot exist without blocking
+def rerank(self, query: str, docs: list[ScoredChunk]) -> list[ScoredChunk]:
     return self.model.predict(pairs)
 
-# ✅ Runs on a worker thread; the event loop stays free
-async def rerank(self, query: str, docs: list[Chunk]) -> list[Chunk]:
-    return await asyncio.to_thread(self.model.predict, pairs)
+# ✅ Interface is async. A local model offloads to a thread; a hosted
+#    reranker would simply await its HTTP call. Both satisfy the same contract.
+async def rerank(self, query: str, docs: list[ScoredChunk],
+                 top_k: int = 5) -> list[ScoredChunk]:
+    scores = await asyncio.to_thread(self.model.predict, pairs)
+    ...
 ```
+
+Why this matters concretely: `BaseEmbeddingProvider` has two planned implementations —
+FastEmbed, which is local CPU work, and OpenAI, which is a network call. A synchronous interface
+would force the OpenAI provider to block the event loop on every request. So the interface is async
+and FastEmbed wraps its own `to_thread`. The caller never needs to know which kind it holds. That is
+the entire point of the abstraction.
 
 Phase 2's ingestion pipeline is the one place we use `multiprocessing` rather than `asyncio`,
 because embedding 650,000 documents is pure CPU work and needs to escape the GIL entirely. §3
