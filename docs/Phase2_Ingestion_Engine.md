@@ -100,10 +100,14 @@ parsers/                Document → [Section]    (ARTICLE / SECTION boundaries)
 chunkers/               Section → [Chunk]       (sentence-aligned, ~400 tokens)
       │                                          + parent chunks at ~1,600
       ▼
-[Chunk]  ──►  Phase 3 stores them
+ChunkBatch  ──►  Phase 3 stores them ──► pipeline.commit()
+      │                                    (or .rollback() if the store failed)
       │
       └── on any failure ──► dead_letter.py, and the run continues
 ```
+
+Note the `commit()` step. Ingestion does not decide that a document is finished — the component that
+actually wrote to Qdrant does. §12 explains why this matters more than it looks.
 
 ---
 
@@ -235,9 +239,10 @@ Normalised-text hashing is stable under exactly those cosmetic changes, because
 `normalise_whitespace` has already collapsed them. So `content_hash` is the right fingerprint for
 "has the *meaning* changed", which is the question the checkpoint needs to answer.
 
-We still keep `hash_file` in `utils.py` — the checkpoint uses it as a **cheap** pre-filter, since
-hashing bytes needs no decoding, parsing, or normalisation. The pattern is: byte hash to decide whether
-to bother opening the document, content hash to decide whether to re-embed it.
+`hash_file` (raw bytes) stays in `utils.py` for Phase 15, where verifying a migration needs a
+byte-exact fingerprint. The checkpoint does **not** use it: even hashing bytes requires reading the
+whole file, so for a cheap pre-dispatch filter it uses `size` + `mtime` from a single `stat()` call
+instead — see §12.
 
 ### Failure Modes
 
@@ -680,10 +685,12 @@ class LegalSectionParser(BaseParser):
     def _build_sections(
         self, document: Document, collected: list[tuple[str, str]]
     ) -> list[Section]:
+        collected = self._absorb_short_sections(collected)
+
         sections: list[Section] = []
         order = 0
         for title, body in collected:
-            if len(body.strip()) < MIN_SECTION_CHARS:
+            if not body.strip():
                 continue
             sections.append(
                 Section(
@@ -696,6 +703,33 @@ class LegalSectionParser(BaseParser):
             )
             order += 1
         return sections
+
+    @staticmethod
+    def _absorb_short_sections(
+        collected: list[tuple[str, str]]
+    ) -> list[tuple[str, str]]:
+        """Merge sub-threshold sections into the previous one rather than dropping them.
+
+        An earlier version discarded any section under `MIN_SECTION_CHARS`, which
+        silently deleted real contract text — a one-line governing-law clause is short
+        AND important. The threshold exists to suppress table-of-contents noise, not to
+        throw away content.
+
+        Absorbing forward keeps every character. The cost is that a TOC entry's text
+        gets appended to the preceding section, which is harmless: it adds a few words
+        of heading-like text to a chunk rather than removing a clause from the index.
+        """
+        absorbed: list[tuple[str, str]] = []
+        for title, body in collected:
+            stripped = body.strip()
+            if not stripped:
+                continue
+            if absorbed and len(stripped) < MIN_SECTION_CHARS:
+                prev_title, prev_body = absorbed[-1]
+                absorbed[-1] = (prev_title, f"{prev_body}\n{stripped}")
+            else:
+                absorbed.append((title, stripped))
+        return absorbed
 ```
 
 ### The Theory: why `section_id` includes `order`
@@ -965,9 +999,13 @@ _ABBREVIATIONS: frozenset[str] = frozenset(
     }
 )
 
-#: Candidate boundary: sentence punctuation, whitespace, then something that looks
-#: like a new sentence — a capital, a quote, or an opening bracket.
-_BOUNDARY = re.compile(r'(?<=[.!?])["\')\]]*\s+(?=["\'(\[]*[A-Z0-9])')
+#: Candidate boundary: sentence punctuation, optional closing quotes/brackets, then
+#: whitespace, then something that looks like the start of a new sentence.
+#:
+#: Used with `finditer`, NOT `re.split`. `re.split` discards whatever the pattern
+#: matches, so the closing-quote group would delete `"` and `)` from the text. We
+#: instead locate boundaries and slice around them, which keeps every character.
+_BOUNDARY = re.compile(r'[.!?]["\'”’)\]]*\s+(?=["\'“‘(\[]*[A-Z0-9])')
 
 #: Trailing token of a fragment, without its final period.
 _LAST_TOKEN = re.compile(r"([A-Za-z][A-Za-z.]*)\.$")
@@ -975,35 +1013,47 @@ _LAST_TOKEN = re.compile(r"([A-Za-z][A-Za-z.]*)\.$")
 #: A single capital letter plus period — an initial, as in "J. Smith".
 _INITIAL = re.compile(r"\b[A-Z]\.$")
 
-#: A number ending in a period — "7.02." or "Section 5." — the sentence continues.
-_TRAILING_NUMBER = re.compile(r"\b\d+(?:\.\d+)*\.$")
+#: A bare enumerator ending a SHORT fragment: "7.02." or "(a)" on its own.
+#: Deliberately narrow — see the note in `_is_false_boundary`.
+_ENUMERATOR_ONLY = re.compile(r"^\(?[A-Za-z0-9]{1,4}(?:\.\d+)*\)?\.?$")
 
 
 def split_sentences(text: str) -> list[str]:
     """Split text into sentences, tolerant of legal abbreviations.
 
-    Strategy: split aggressively on punctuation boundaries, then merge back any
-    fragment whose break was caused by an abbreviation, an initial, or a number.
-    Splitting and repairing is far easier to extend than one exhaustive regex.
+    Strategy: locate candidate boundaries, then merge back any break caused by an
+    abbreviation or an initial. Splitting and repairing is far easier to extend than
+    one exhaustive regex.
+
+    Implementation note: boundaries are found with `finditer` and the text is sliced,
+    rather than using `re.split`. `re.split` removes the matched separator, and since
+    the separator includes optional closing quotes and brackets, splitting would
+    silently delete characters like `"` and `)` from the document.
     """
     text = text.strip()
     if not text:
         return []
 
-    fragments = _BOUNDARY.split(text)
-    if len(fragments) == 1:
+    # Slice points: end of each candidate boundary match. Keeping the punctuation
+    # with the LEFT fragment is what preserves it.
+    cuts: list[int] = [m.end() for m in _BOUNDARY.finditer(text)]
+    if not cuts:
         return [text]
 
     sentences: list[str] = []
-    buffer = fragments[0]
+    buffer = ""
+    start = 0
 
-    for fragment in fragments[1:]:
+    for cut in cuts:
+        fragment = text[start:cut]
+        start = cut
+        buffer += fragment
         if _is_false_boundary(buffer):
-            buffer = f"{buffer} {fragment}"       # not a real break — rejoin
-        else:
-            sentences.append(buffer.strip())
-            buffer = fragment
+            continue                              # not a real break — keep accumulating
+        sentences.append(buffer.strip())
+        buffer = ""
 
+    buffer += text[start:]
     if buffer.strip():
         sentences.append(buffer.strip())
 
@@ -1014,7 +1064,15 @@ def _is_false_boundary(fragment: str) -> bool:
     """Whether `fragment` ends in something that only looks like a sentence end."""
     tail = fragment.rstrip()
 
-    if _INITIAL.search(tail) or _TRAILING_NUMBER.search(tail):
+    if _INITIAL.search(tail):
+        return True
+
+    # A short fragment that is nothing but an enumerator — a stray "7.02." or "(a)."
+    # left over from a list. Deliberately requires the WHOLE fragment to be the
+    # enumerator: an earlier version treated any trailing number as a false boundary,
+    # which merged "The cap is $2,000,000." into the next sentence because it ends in
+    # "000.". Numbers legitimately end sentences far more often than they don't.
+    if len(tail) <= 8 and _ENUMERATOR_ONLY.match(tail):
         return True
 
     match = _LAST_TOKEN.search(tail)
@@ -1022,8 +1080,7 @@ def _is_false_boundary(fragment: str) -> bool:
         token = match.group(1).replace(".", "").lower()
         if token in _ABBREVIATIONS:
             return True
-        # A single letter, e.g. the "(a)" enumerations common in contracts.
-        if len(token) == 1:
+        if len(token) == 1:                        # single letter, e.g. "(a)" lists
             return True
 
     return False
@@ -1050,13 +1107,11 @@ class SentenceChunker(BaseChunker):
             raise ChunkingError("overlap_sentences must be >= 0")
 
     def chunk(self, section: Section, document: Document) -> list[Chunk]:
-        texts = self.split_text(section.text)
+        texts = self._merge_undersized(self.split_text(section.text))
 
         chunks: list[Chunk] = []
         for index, text in enumerate(texts):
             tokens = count_tokens(text)
-            if tokens < self.min_tokens:
-                continue                          # fragment too small to be useful alone
             chunks.append(
                 Chunk(
                     chunk_id=make_chunk_id(document.doc_id, section.section_id, index),
@@ -1102,7 +1157,20 @@ class SentenceChunker(BaseChunker):
                 budget += lengths[end]
                 end += 1
 
-            chunks.append(" ".join(sentences[start:end]))
+            # Summing per-sentence token counts is an ESTIMATE, not the count of the
+            # joined string: tokenizers merge across the inserted space, so the real
+            # figure can differ either way. Verify the actual joined text and shed
+            # trailing sentences until it fits, so `max_tokens` is a genuine ceiling
+            # rather than an approximation we quietly exceed.
+            while end > start + 1:
+                candidate = " ".join(sentences[start:end])
+                if count_tokens(candidate) <= self.max_tokens:
+                    break
+                end -= 1
+            else:
+                candidate = " ".join(sentences[start:end])
+
+            chunks.append(candidate)
 
             if end >= total:
                 break
@@ -1118,6 +1186,35 @@ class SentenceChunker(BaseChunker):
             start = next_start
 
         return chunks
+
+    def _merge_undersized(self, texts: list[str]) -> list[str]:
+        """Fold chunks below `min_tokens` into their neighbour instead of dropping them.
+
+        An earlier version discarded anything under the floor, which silently deleted
+        source content — a trailing clause, a short proviso, the final sentence of a
+        section. Losing contract text to a tuning constant is not acceptable: if it is
+        not indexed, it can never be retrieved, and nothing reports the loss.
+
+        Merging keeps every character while still avoiding standalone fragments too
+        small to embed meaningfully.
+        """
+        if not texts:
+            return []
+
+        merged: list[str] = []
+        for text in texts:
+            if merged and count_tokens(text) < self.min_tokens:
+                candidate = f"{merged[-1]} {text}"
+                # Merging must not breach the ceiling. If it would, the fragment stays
+                # standalone — undersized but present, which is the priority.
+                if count_tokens(candidate) <= self.max_tokens:
+                    merged[-1] = candidate
+                    continue
+            merged.append(text)
+
+        # A single undersized chunk with nothing to merge into is kept as-is; a short
+        # section is still better indexed than discarded.
+        return merged
 
     def _split_oversized(self, sentence: str) -> list[str]:
         """Hard-split a single sentence that exceeds the token budget.
@@ -1164,14 +1261,22 @@ lower it. If answers keep missing figures that sit near boundaries, raise it.
 **Ingestion hangs with no error and no progress.** Almost certainly an overlap loop, which is why the
 `next_start <= start` guard exists. If you altered the loop, restore that check.
 
-**Chunks split at `Inc.` or `Section 7.02`.** An abbreviation is missing from `_ABBREVIATIONS`, or
-`_TRAILING_NUMBER` was removed. Test `split_sentences` on a real paragraph directly.
+**Chunks split at `Inc.` or `Corp.`.** An abbreviation is missing from `_ABBREVIATIONS`. Test
+`split_sentences` on a real paragraph directly.
+
+**Quotation marks or brackets missing from chunk text.** The boundary regex is being used with
+`re.split` instead of `finditer`. `re.split` discards whatever the pattern matched, and the pattern
+includes closing punctuation, so those characters are deleted from the document.
 
 **Chunks far under `max_tokens`.** Expected. A chunk closes when the *next* sentence would overflow, so
 average size lands well below the ceiling. It is a ceiling, not a target.
 
-**Many chunks dropped by `min_tokens`.** Signature/notary blocks and TOC fragments. Check the counts
-are plausible before raising the threshold.
+**Chunks noticeably over `max_tokens`.** The re-tokenisation check after joining was skipped. Summing
+per-sentence counts is only an estimate; the joined string must be measured.
+
+**Chunks that look like two unrelated clauses glued together.** Expected, and preferable to the
+alternative. Sub-`min_tokens` fragments are merged into their neighbour rather than discarded, because
+dropping them deletes contract text from the index permanently and silently.
 
 ---
 
@@ -1401,6 +1506,12 @@ def discover_documents(
     that returns a list of them stalls for minutes and wastes hundreds of MB before
     a single document is processed.
 
+    Memory is flat *with respect to the corpus*, not literally constant: one
+    directory's entries are materialised at a time in order to sort them, which is
+    what makes ordering deterministic. For EDGAR's year partitions (tens of thousands
+    of entries each) that is a few MB. A single directory holding all 650k files would
+    need `os.scandir` without sorting, trading reproducibility for memory.
+
     Args:
         root: The `contracts/` directory, partitioned by year.
         extensions: Lowercase suffixes to accept, e.g. {".txt"}. None accepts all.
@@ -1417,6 +1528,18 @@ def discover_documents(
         )
 
     yielded = 0
+
+    # Files sitting directly in root are walked too. An earlier version returned
+    # `subdirs or [root]`, which meant that as soon as root had ANY subdirectory, every
+    # loose file at the top level was silently invisible.
+    for path in _files_in(root, extensions):
+        if years:
+            break                                 # a year filter implies partitioned layout
+        yield path
+        yielded += 1
+        if limit is not None and yielded >= limit:
+            return
+
     for year_dir in _sorted_subdirs(root):
         if years and year_dir.name not in years:
             continue
@@ -1432,14 +1555,28 @@ def discover_documents(
 
 
 def _sorted_subdirs(root: Path) -> list[Path]:
-    """Immediate subdirectories, sorted. Falls back to `root` itself if it has none."""
+    """Immediate subdirectories of `root`, sorted by name."""
     with os.scandir(root) as entries:
-        dirs = sorted(
+        return sorted(
             (Path(e.path) for e in entries if e.is_dir(follow_symlinks=False)),
             key=lambda p: p.name,
         )
-    # A flat corpus (no year partitioning) still needs to be walked.
-    return dirs or [root]
+
+
+def _files_in(directory: Path, extensions: set[str] | None) -> Iterator[Path]:
+    """Matching files directly inside `directory`, non-recursive, sorted."""
+    try:
+        with os.scandir(directory) as entries:
+            listing = sorted(entries, key=lambda e: e.name)
+    except (PermissionError, OSError):
+        return
+    for entry in listing:
+        if not entry.is_file(follow_symlinks=False):
+            continue
+        path = Path(entry.path)
+        if extensions and path.suffix.lower() not in extensions:
+            continue
+        yield path
 
 
 def _walk_files(directory: Path, extensions: set[str] | None) -> Iterator[Path]:
@@ -1546,6 +1683,19 @@ is indexed still current?
 discovery order changes. A set of `doc_id → content_hash` answers both questions — presence means done,
 and a hash mismatch means changed and needing re-ingestion.
 
+**Version the pipeline configuration, not just the content.** This one is easy to miss and quietly
+poisons your index. `content_hash` answers "did the document change?" — but the indexed chunks also
+depend on *how* you chunked. Change `MAX_TOKENS_PER_CHUNK` from 400 to 600, or improve the section
+parser, and every document's stored chunks are now stale while its content hash is unchanged. Resume
+would skip all of them. So the checkpoint stores a **config fingerprint**, and a mismatch invalidates
+every record.
+
+**Record cheap identity for a pre-dispatch skip.** Deciding whether to skip on `content_hash` alone
+means you must load, normalise, and hash the document first — which is most of the work. Recording
+`size` and `mtime` alongside lets the parent skip an unchanged file with a single `stat()` call, before
+sending it to a worker at all. This is the same trick `make` and `rsync` use, and on a resume over a
+mostly-complete corpus it is the difference between hours and seconds.
+
 **JSON Lines, appended.** Not a single JSON object, because rewriting a 650k-entry file after every
 document is quadratic. Not SQLite, because that adds a dependency and locking concerns across
 multiprocessing workers for what is fundamentally an append-only log. JSONL appends in constant time
@@ -1556,28 +1706,75 @@ process was killed mid-write.
 Batching by count and time bounds the loss to a few seconds of work.
 
 ```python
+import hashlib
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
 from src.core.logging import logger
 
 
+def pipeline_fingerprint() -> str:
+    """Short hash of every setting that affects the chunks we produce.
+
+    If any of these change, previously indexed chunks are stale even though the source
+    documents are byte-identical. The fingerprint is stored in the checkpoint so a
+    config change invalidates it rather than silently skipping documents that need
+    re-chunking.
+
+    Add to this list whenever you add a setting that changes chunk output. Things that
+    are NOT settings — `ParentChildChunker.parent_tokens`, the section-header regexes,
+    the abbreviation list — are covered by the manual `"v1"` marker: bump it to `"v2"`
+    when you change chunking or parsing logic. It is a blunt instrument, but a stale
+    index is worse than a redundant re-ingest.
+    """
+    from config.settings import settings
+
+    material = "|".join(
+        str(x)
+        for x in (
+            "v1",                                 # bump manually on parser/chunker logic changes
+            settings.MAX_TOKENS_PER_CHUNK,
+            settings.SENTENCE_OVERLAP,
+            settings.DENSE_MODEL_NAME,
+            settings.SPARSE_MODEL_NAME,
+        )
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class CompletedDocument:
+    """What we remember about a successfully ingested document."""
+
+    content_hash: str
+    size: int
+    mtime: float
+
+
 class IngestionCheckpoint:
     """Append-only record of successfully ingested documents, for resumable runs.
 
-    Format: one JSON object per line — {"doc_id", "content_hash", "chunks", "ts"}.
-    Append-only so recording a document is O(1) rather than rewriting the file, and
-    so a process killed mid-write loses at most the final line.
+    Format: one JSON object per line. Append-only so recording is O(1) rather than
+    rewriting a 650k-entry file, and so a process killed mid-write loses at most the
+    final line.
+
+    Two-phase by design. `stage()` remembers a document in memory; `commit()` writes it
+    to disk. The pipeline only commits once the CONSUMER confirms the chunks were
+    actually stored — otherwise a storage failure would leave the checkpoint claiming
+    documents are indexed when they are not, and resume would skip them forever.
 
     Usage:
         with IngestionCheckpoint(settings.checkpoint_dir) as cp:
-            if cp.should_skip(doc_id, content_hash):
+            if cp.should_skip_path(path):        # cheap: one stat(), no file read
                 continue
             ...
-            cp.record(doc_id, content_hash, len(chunks))
+            cp.stage(doc_id, content_hash, path)
+            # ... after storage succeeds:
+            cp.commit()
     """
 
     def __init__(
@@ -1591,8 +1788,10 @@ class IngestionCheckpoint:
         self.path = directory / f"{name}.jsonl"
         self.flush_every = flush_every
         self.flush_seconds = flush_seconds
+        self.fingerprint = pipeline_fingerprint()
 
-        self._done: dict[str, str] = {}
+        self._done: dict[str, CompletedDocument] = {}
+        self._staged: list[dict[str, object]] = []
         self._handle = None
         self._pending = 0
         self._last_flush = time.monotonic()
@@ -1602,7 +1801,10 @@ class IngestionCheckpoint:
     # ─── context manager ───────────────────────────────────────────────────
 
     def __enter__(self) -> "IngestionCheckpoint":
+        is_new = not self.path.exists()
         self._handle = open(self.path, "a", encoding="utf-8")
+        if is_new:
+            self._write_header()
         return self
 
     def __exit__(
@@ -1615,9 +1817,34 @@ class IngestionCheckpoint:
 
     # ─── API ───────────────────────────────────────────────────────────────
 
-    def should_skip(self, doc_id: str, content_hash: str) -> bool:
-        """True if this exact content was already ingested successfully."""
-        return self._done.get(doc_id) == content_hash
+    def should_skip_path(self, path: Path) -> bool:
+        """Cheap pre-dispatch skip: one `stat()`, no file read, no parsing.
+
+        True when this exact file — same size, same mtime — was already ingested. This
+        is what makes resume genuinely fast: without it, every completed document would
+        still be loaded, parsed, and chunked in a worker just to compute the content
+        hash that tells us to discard the result.
+
+        Deliberately conservative. mtime can change without content changing (a
+        `touch`, a re-checkout), and the only cost of a false negative is redundant
+        work that `should_skip_content` then catches. A false *positive* would skip a
+        genuinely changed file, and size+mtime together make that vanishingly unlikely.
+        """
+        from src.core.utils import make_doc_id
+
+        record = self._done.get(make_doc_id(path))
+        if record is None:
+            return False
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+        return record.size == stat.st_size and record.mtime == stat.st_mtime
+
+    def should_skip_content(self, doc_id: str, content_hash: str) -> bool:
+        """Authoritative skip: this exact content was already ingested."""
+        record = self._done.get(doc_id)
+        return record is not None and record.content_hash == content_hash
 
     def is_known(self, doc_id: str) -> bool:
         """True if the document was ingested at all, regardless of version.
@@ -1627,27 +1854,66 @@ class IngestionCheckpoint:
         """
         return doc_id in self._done
 
-    def record(self, doc_id: str, content_hash: str, chunk_count: int) -> None:
+    def stage(self, doc_id: str, content_hash: str, path: Path, chunk_count: int) -> None:
+        """Remember a document in memory, pending confirmation that it was stored.
+
+        Nothing is written to disk here. `commit()` persists staged records once the
+        consumer confirms storage succeeded.
+        """
+        try:
+            stat = path.stat()
+            size, mtime = stat.st_size, stat.st_mtime
+        except OSError:
+            size, mtime = 0, 0.0
+
+        self._staged.append(
+            {
+                "doc_id": doc_id,
+                "content_hash": content_hash,
+                "size": size,
+                "mtime": mtime,
+                "chunks": chunk_count,
+                "ts": time.time(),
+            }
+        )
+
+    def commit(self) -> int:
+        """Persist all staged records. Call ONLY after storage has succeeded.
+
+        Returns the number committed. This is the point at which a document becomes
+        "done" for resume purposes, and it is deliberately the consumer's decision.
+        """
         if self._handle is None:
             raise RuntimeError("Checkpoint used outside its context manager")
+        if not self._staged:
+            return 0
 
-        self._handle.write(
-            json.dumps(
-                {
-                    "doc_id": doc_id,
-                    "content_hash": content_hash,
-                    "chunks": chunk_count,
-                    "ts": time.time(),
-                }
+        for record in self._staged:
+            self._handle.write(json.dumps(record) + "\n")
+            self._done[str(record["doc_id"])] = CompletedDocument(
+                content_hash=str(record["content_hash"]),
+                size=int(record["size"]),        # type: ignore[arg-type]
+                mtime=float(record["mtime"]),    # type: ignore[arg-type]
             )
-            + "\n"
-        )
-        self._done[doc_id] = content_hash
-        self._pending += 1
+
+        committed = len(self._staged)
+        self._staged.clear()
+        self._pending += committed
 
         elapsed = time.monotonic() - self._last_flush
         if self._pending >= self.flush_every or elapsed >= self.flush_seconds:
             self.flush()
+        return committed
+
+    def discard_staged(self) -> int:
+        """Drop staged records without persisting. Call when storage FAILED.
+
+        Those documents stay un-checkpointed and will be reprocessed on the next run,
+        which is exactly the behaviour we want.
+        """
+        dropped = len(self._staged)
+        self._staged.clear()
+        return dropped
 
     def flush(self) -> None:
         """Force buffered records to disk.
@@ -1670,25 +1936,57 @@ class IngestionCheckpoint:
             self._handle = None
 
     def reset(self) -> None:
-        """Delete all checkpoint state, forcing a full re-ingestion."""
-        self.close()
-        self.path.unlink(missing_ok=True)
+        """Truncate all checkpoint state, forcing a full re-ingestion.
+
+        Truncates rather than closing, so this is safe to call INSIDE the context
+        manager. An earlier version called `close()`, which set the handle to None and
+        made the next write raise "used outside its context manager" — and since
+        `resume=False` calls this, that path was broken.
+        """
+        self._staged.clear()
         self._done.clear()
+
+        if self._handle is not None:
+            self._handle.close()
+        self.path.unlink(missing_ok=True)
+        self._handle = open(self.path, "a", encoding="utf-8")
+        self._write_header()
+        self._pending = 0
+
         logger.warning("Checkpoint reset", extra={"path": str(self.path)})
 
     @property
     def completed_count(self) -> int:
         return len(self._done)
 
+    @property
+    def staged_count(self) -> int:
+        return len(self._staged)
+
     # ─── internals ─────────────────────────────────────────────────────────
 
+    def _write_header(self) -> None:
+        """First line records the config fingerprint that produced these records."""
+        if self._handle is None:
+            return
+        self._handle.write(
+            json.dumps({"_header": True, "fingerprint": self.fingerprint}) + "\n"
+        )
+
     def _load(self) -> None:
-        """Rebuild in-memory state from the log, tolerating a truncated tail."""
+        """Rebuild in-memory state from the log, tolerating a truncated tail.
+
+        If the stored fingerprint does not match the current configuration, every
+        record is discarded: the documents are unchanged but the chunks they produced
+        are not what this configuration would produce now.
+        """
         if not self.path.exists():
             return
 
         loaded = 0
         corrupt = 0
+        stored_fingerprint: str | None = None
+
         with open(self.path, encoding="utf-8") as handle:
             for line in handle:
                 line = line.strip()
@@ -1696,12 +1994,34 @@ class IngestionCheckpoint:
                     continue
                 try:
                     record = json.loads(line)
-                    self._done[record["doc_id"]] = record["content_hash"]
-                    loaded += 1
-                except (json.JSONDecodeError, KeyError):
-                    # Expected on the last line if a previous run was killed
+                except json.JSONDecodeError:
+                    # Expected on the final line if a previous run was killed
                     # mid-write. Discard and carry on.
                     corrupt += 1
+                    continue
+
+                if record.get("_header"):
+                    stored_fingerprint = record.get("fingerprint")
+                    continue
+
+                try:
+                    self._done[record["doc_id"]] = CompletedDocument(
+                        content_hash=record["content_hash"],
+                        size=record.get("size", 0),
+                        mtime=record.get("mtime", 0.0),
+                    )
+                    loaded += 1
+                except KeyError:
+                    corrupt += 1
+
+        if stored_fingerprint is not None and stored_fingerprint != self.fingerprint:
+            logger.warning(
+                "Checkpoint fingerprint mismatch — chunking configuration changed, so "
+                "all previous records are stale and will be ignored.",
+                extra={"stored": stored_fingerprint, "current": self.fingerprint},
+            )
+            self._done.clear()
+            loaded = 0
 
         logger.info(
             "Checkpoint loaded",
@@ -1768,7 +2088,6 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from src.core.exceptions import RAGException
 from src.core.logging import logger
 from src.core.utils import safe_filename
 
@@ -1791,21 +2110,41 @@ class DeadLetterQueue:
 
         self._counts: Counter[str] = Counter()
 
-    def record(self, file_path: str | Path, error: Exception, stage: str) -> None:
-        """Log one failure. Never raises — a failing error handler is unforgivable."""
-        path = Path(file_path)
-        error_type = type(error).__name__
+    def record(
+        self,
+        file_path: str | Path,
+        *,
+        error_type: str,
+        message: str,
+        stage: str,
+        details: dict | None = None,
+        traceback_text: str = "",
+    ) -> None:
+        """Log one failure. Never raises — a failing error handler is unforgivable.
 
-        entry = {
+        Takes `error_type` as a STRING rather than an exception object, because most
+        failures originate in a worker process and cross the boundary as plain data. An
+        earlier version accepted an `Exception` and the pipeline wrapped everything in
+        `RuntimeError`, so the log recorded `RuntimeError` for every failure — losing
+        exactly the `ParsingError` / `ChunkingError` / `DocumentLoadError` distinction
+        this file exists to report.
+        """
+        path = Path(file_path)
+
+        entry: dict[str, object] = {
             "path": path.as_posix(),
             "file_name": path.name,
             "stage": stage,
             "error_type": error_type,
-            "message": str(error),
+            "message": message,
             "ts": time.time(),
         }
-        if isinstance(error, RAGException):
-            entry["details"] = error.details
+        if details:
+            entry["details"] = details
+        if traceback_text:
+            # Only unexpected failures carry a traceback; expected RAGExceptions do
+            # not need one and it would bloat the log enormously at 650k documents.
+            entry["traceback"] = traceback_text
 
         try:
             with open(self.log_path, "a", encoding="utf-8") as handle:
@@ -1826,14 +2165,6 @@ class DeadLetterQueue:
             "Quarantined document",
             extra={"path": str(path), "stage": stage, "error_type": error_type},
         )
-
-    def merge_counts(self, counts: dict[str, int]) -> None:
-        """Fold in tallies produced by a worker process.
-
-        Workers cannot share this object across the process boundary, so each keeps
-        its own counts and the parent merges them at the end.
-        """
-        self._counts.update(counts)
 
     @property
     def total(self) -> int:
@@ -1927,7 +2258,7 @@ you are on Windows.
 
 ```python
 import multiprocessing as mp
-from collections import Counter
+import traceback
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1949,7 +2280,13 @@ from .parsers.metadata_extractor import ContractMetadataExtractor
 
 @dataclass
 class DocumentResult:
-    """What a worker returns. Must be picklable — hence plain data only."""
+    """What a worker returns. Must be picklable — hence plain data only.
+
+    Failures are carried as strings rather than exception objects, so the parent can
+    record the ORIGINAL error type. Wrapping worker failures in a generic exception in
+    the parent would erase the ParsingError / ChunkingError distinction that makes the
+    dead-letter report useful.
+    """
 
     path: str
     doc_id: str = ""
@@ -1957,11 +2294,29 @@ class DocumentResult:
     chunks: list[Chunk] = field(default_factory=list)
     error_type: str | None = None
     error_message: str = ""
+    error_details: dict = field(default_factory=dict)
+    traceback_text: str = ""
     stage: str = ""
 
     @property
     def ok(self) -> bool:
         return self.error_type is None
+
+
+@dataclass
+class ChunkBatch:
+    """A batch of chunks handed to the consumer, plus the documents that produced it.
+
+    The consumer must call `pipeline.commit()` after storing these successfully, or
+    `pipeline.rollback()` if storage failed. Until commit, the source documents remain
+    un-checkpointed and will be reprocessed on the next run.
+    """
+
+    chunks: list[Chunk]
+    document_count: int
+
+    def __len__(self) -> int:
+        return len(self.chunks)
 
 
 @dataclass
@@ -2038,15 +2393,19 @@ def _process_one(path_str: str) -> DocumentResult:
         )
 
     except RAGException as exc:
+        # Expected failure. Carries its own structured details; no traceback needed.
         return DocumentResult(
             path=path_str, error_type=type(exc).__name__,
-            error_message=str(exc), stage=stage,
+            error_message=str(exc), error_details=exc.details, stage=stage,
         )
     except Exception as exc:
-        # Genuinely unexpected. Still must not escape the worker.
+        # Genuinely unexpected. Capture the traceback — this is the only chance to see
+        # it, since the exception cannot cross the process boundary intact.
         return DocumentResult(
             path=path_str, error_type=type(exc).__name__,
-            error_message=f"Unhandled: {exc}", stage=stage,
+            error_message=f"Unhandled: {exc}",
+            traceback_text=traceback.format_exc(),
+            stage=stage,
         )
 
 
@@ -2067,6 +2426,32 @@ class IngestionPipeline:
         self.batch_size = batch_size
         self.stats = IngestionStats()
         self.dlq = DeadLetterQueue(settings.dead_letter_dir, copy_files=copy_failed_files)
+        self._checkpoint: IngestionCheckpoint | None = None
+
+    # ─── transaction control, called by the consumer ────────────────────────
+
+    def commit(self) -> int:
+        """Mark the last yielded batch's documents as successfully ingested.
+
+        Call this ONLY after the chunks have actually been stored. Until you do, those
+        documents stay un-checkpointed and will be reprocessed next run — which is the
+        correct behaviour if storage failed.
+        """
+        if self._checkpoint is None:
+            raise RuntimeError("commit() called outside an active run()")
+        return self._checkpoint.commit()
+
+    def rollback(self) -> int:
+        """Discard the last yielded batch's checkpoint records after a storage failure."""
+        if self._checkpoint is None:
+            raise RuntimeError("rollback() called outside an active run()")
+        dropped = self._checkpoint.discard_staged()
+        if dropped:
+            logger.warning(
+                "Rolled back checkpoint records after a storage failure",
+                extra={"documents": dropped},
+            )
+        return dropped
 
     @telemetry.span("ingestion.run")
     def run(
@@ -2074,32 +2459,39 @@ class IngestionPipeline:
         limit: int | None = None,
         years: set[str] | None = None,
         resume: bool = True,
-    ) -> Iterator[list[Chunk]]:
+    ) -> Iterator[ChunkBatch]:
         """Process the corpus, yielding batches of chunks.
 
-        A generator so the caller can stream batches into the vector store instead
-        of accumulating every chunk in memory — the whole corpus would be tens of
-        millions of chunks.
+        A generator so the caller can stream batches into the vector store instead of
+        accumulating every chunk in memory — the whole corpus is tens of millions of
+        chunks.
+
+        The caller MUST call `commit()` after storing each batch:
+
+            for batch in pipeline.run():
+                try:
+                    await store.upsert_points(batch.chunks, ...)
+                    pipeline.commit()
+                except Exception:
+                    pipeline.rollback()
+                    raise
 
         Args:
-            limit: Maximum documents to process. Defaults to SAMPLE_LIMIT when
-                SAMPLE_MODE is on.
+            limit: Maximum documents to *dispatch for processing*. Documents skipped by
+                the checkpoint do not count against it, so `limit=50` on a resumed run
+                processes 50 NEW documents rather than inspecting 50 finished ones.
             years: Restrict to these year directories.
-            resume: Skip documents already recorded in the checkpoint.
+            resume: When False, wipe the checkpoint and reprocess everything.
         """
         new_request_id()
 
         if limit is None and settings.SAMPLE_MODE:
             limit = settings.SAMPLE_LIMIT
             logger.warning(
-                "SAMPLE_MODE is on — processing a subset only",
-                extra={"limit": limit},
+                "SAMPLE_MODE is on — processing a subset only", extra={"limit": limit}
             )
 
         extensions = LoaderFactory().supported_extensions
-        paths = discover_documents(
-            settings.contracts_dir, extensions=extensions, years=years, limit=limit
-        )
 
         logger.info(
             "Starting ingestion",
@@ -2112,85 +2504,150 @@ class IngestionPipeline:
         )
 
         with IngestionCheckpoint(settings.checkpoint_dir) as checkpoint:
-            if not resume:
-                checkpoint.reset()
-            elif checkpoint.completed_count:
-                logger.info(
-                    "Resuming from checkpoint",
-                    extra={"already_done": checkpoint.completed_count},
-                )
+            self._checkpoint = checkpoint
+            try:
+                if not resume:
+                    checkpoint.reset()
+                elif checkpoint.completed_count:
+                    logger.info(
+                        "Resuming from checkpoint",
+                        extra={"already_done": checkpoint.completed_count},
+                    )
 
-            yield from self._run_pool(paths, checkpoint)
+                # NOTE: discovery is deliberately unbounded. The limit is enforced on
+                # DISPATCHED documents in _dispatch_paths, after checkpoint filtering.
+                paths = discover_documents(
+                    settings.contracts_dir, extensions=extensions, years=years
+                )
+                yield from self._run_pool(paths, checkpoint, limit)
+            finally:
+                self._checkpoint = None
 
         self.dlq.report(self.stats.processed + self.stats.failed)
         logger.info("Ingestion complete", extra=self.stats.summary())
 
     # ─── internals ─────────────────────────────────────────────────────────
 
+    def _dispatch_paths(
+        self, paths: Iterator[Path], checkpoint: IngestionCheckpoint, limit: int | None
+    ) -> Iterator[str]:
+        """Filter and cap the path stream BEFORE it reaches the workers.
+
+        Two reasons this happens here rather than after processing. Skipping on a cheap
+        `stat()` avoids loading, parsing, and chunking a document only to discard the
+        result — which is most of the cost of a resume. And counting the limit against
+        dispatched documents means `limit=50` means 50 new documents, not 50 files
+        inspected.
+        """
+        dispatched = 0
+        for path in paths:
+            if checkpoint.should_skip_path(path):
+                self.stats.skipped += 1
+                continue
+            yield str(path)
+            dispatched += 1
+            if limit is not None and dispatched >= limit:
+                return
+
     def _run_pool(
-        self, paths: Iterator[Path], checkpoint: IngestionCheckpoint
-    ) -> Iterator[list[Chunk]]:
+        self,
+        paths: Iterator[Path],
+        checkpoint: IngestionCheckpoint,
+        limit: int | None,
+    ) -> Iterator[ChunkBatch]:
         batch: list[Chunk] = []
-        worker_error_counts: Counter[str] = Counter()
+        batch_documents = 0
 
         # `imap_unordered` over `map`: it streams results as they finish instead of
-        # materialising the full result list, and it does not wait for slow documents
-        # to preserve ordering — ordering is irrelevant here.
+        # materialising the full result list, and it does not wait on slow documents to
+        # preserve ordering — ordering is irrelevant here.
         #
-        # `chunksize` batches task dispatch. Sending 650k paths one at a time makes
-        # IPC overhead dominate; 32 amortises it without starving workers.
+        # `chunksize` batches task dispatch. Sending 650k paths one at a time makes IPC
+        # overhead dominate; 32 amortises it without starving workers.
         with mp.Pool(processes=self.workers, initializer=_init_worker) as pool:
             results = pool.imap_unordered(
-                _process_one, (str(p) for p in paths), chunksize=32
+                _process_one,
+                self._dispatch_paths(paths, checkpoint, limit),
+                chunksize=32,
             )
 
             for result in results:
                 if not result.ok:
                     self.stats.failed += 1
-                    worker_error_counts[result.error_type or "Unknown"] += 1
+                    # Record the ORIGINAL error type from the worker, not a wrapper.
                     self.dlq.record(
                         result.path,
-                        RuntimeError(result.error_message),
+                        error_type=result.error_type or "Unknown",
+                        message=result.error_message,
                         stage=result.stage,
+                        details=result.error_details,
+                        traceback_text=result.traceback_text,
                     )
                     continue
 
-                if checkpoint.should_skip(result.doc_id, result.content_hash):
+                # Authoritative content check. The cheap stat() filter already removed
+                # untouched files; this catches a file whose mtime changed but whose
+                # content did not.
+                if checkpoint.should_skip_content(result.doc_id, result.content_hash):
                     self.stats.skipped += 1
                     continue
 
                 batch.extend(result.chunks)
+                batch_documents += 1
                 self.stats.processed += 1
                 self.stats.chunks_produced += len(result.chunks)
-                checkpoint.record(result.doc_id, result.content_hash, len(result.chunks))
+
+                # STAGED, not committed. Becomes durable only when the consumer calls
+                # commit() after storing. Recording here would mean a storage failure
+                # leaves the checkpoint claiming these documents are indexed, and
+                # resume would skip them forever.
+                checkpoint.stage(
+                    result.doc_id, result.content_hash, Path(result.path), len(result.chunks)
+                )
 
                 if len(batch) >= self.batch_size:
-                    yield batch
+                    yield ChunkBatch(chunks=batch, document_count=batch_documents)
                     batch = []
+                    batch_documents = 0
 
                 if self.stats.processed % 1000 == 0:
                     logger.info("Progress", extra=self.stats.summary())
 
         if batch:
-            yield batch
-
-        self.dlq.merge_counts(dict(worker_error_counts))
+            yield ChunkBatch(chunks=batch, document_count=batch_documents)
 ```
 
-### Why skipping happens in the parent, not the worker
+### The Theory: two-phase commit, and why the skip check is two-tier
 
-Look closely: the worker fully processes a document, and only then does the parent check
-`should_skip`. That looks wasteful — why not skip before doing the work?
+Two subtleties here are worth real attention, because both were bugs in the first draft of this file
+and both are the kind that produce silent, permanent data loss.
 
-Because the skip decision needs `content_hash`, and computing that requires loading and normalising the
-document. The check is "has this *content* been ingested", not "has this path been seen". Path-based
-skipping would miss edited documents entirely.
+**Two-phase commit.** The obvious design records a document as "done" right after chunking it. That is
+wrong, because chunking is not the last step — *storing* is, and storing happens in the consumer, after
+the batch is yielded. If Qdrant is down when the consumer tries to write, the naive design has already
+written "done" to the checkpoint. The next run skips those documents. They are never indexed, and
+nothing ever tells you.
 
-There is a cheaper pre-filter available and it is worth knowing about: `hash_file` on the raw bytes
-needs no decoding or parsing, so a two-tier scheme — byte hash to skip in the parent before dispatch,
-content hash to confirm — would avoid most of the wasted work on resume. We do not implement it here
-because it adds a second hash store for a cost that only appears on repeated runs of an already-complete
-corpus. Worth adding if you find yourself resuming often.
+So the checkpoint is split. `stage()` holds records in memory; `commit()` persists them. The consumer
+calls `commit()` only after a successful write, or `rollback()` on failure. This is the same reasoning
+as a database transaction: **the party that knows whether the work succeeded is the party that must
+decide to commit.** Ingestion cannot know, so it must not decide.
+
+**Two-tier skipping.** The authoritative question is "has this *content* been ingested", which needs
+`content_hash`, which needs the document loaded and normalised — most of the work. Skipping only on
+that basis means a resume over a finished corpus still loads, parses, and chunks all 650,000
+documents just to throw the results away.
+
+The fix is a cheap pre-filter that runs in the parent before dispatch: compare the file's `size` and
+`mtime` against what the checkpoint recorded. That is one `stat()` call, no read, no decode, no
+tokenizing. This is exactly how `make` and `rsync` decide what is stale.
+
+The two tiers have deliberately asymmetric risk. A false negative in the cheap check — mtime changed
+but content did not, as happens after a fresh `git checkout` — costs one document of redundant work,
+and `should_skip_content` catches it before anything is re-staged. A false positive would skip a
+genuinely changed document, so the cheap check requires **both** size and mtime to match, which makes
+that essentially impossible in practice. When designing a fast path, make sure its failure mode is
+"does extra work", never "silently skips work".
 
 ### Failure Modes
 
@@ -2202,7 +2659,17 @@ if __name__ == "__main__":
     pipeline = IngestionPipeline()
     for batch in pipeline.run(limit=100):
         print(len(batch))
+        pipeline.commit()
 ```
+
+**Resume reprocesses everything from scratch.** Either the consumer never called `commit()` — nothing
+was ever recorded as done — or the pipeline fingerprint changed. A fingerprint mismatch is logged at
+WARNING with both values; if you changed `MAX_TOKENS_PER_CHUNK`, this is correct behaviour, because the
+previously stored chunks are no longer what this configuration produces.
+
+**Documents marked done but missing from Qdrant.** `commit()` was called before the write, or called
+unconditionally in a `finally`. Commit belongs strictly on the success path, with `rollback()` on the
+failure path.
 
 **`PicklingError: Can't pickle <class '...'>`** — something unpicklable is crossing the boundary. Usual
 suspects are a lambda, a local function, an open file handle, or a database client. Keep worker
@@ -2234,7 +2701,7 @@ from pathlib import Path
 
 from config.settings import settings
 from src.core.logging import logger, new_request_id
-from src.core.models import ChunkLevel
+from src.core.models import Chunk, ChunkLevel
 from src.core.utils import count_tokens
 from src.ingestion.chunkers.parent_child_chunker import ParentChildChunker
 from src.ingestion.chunkers.sentence_chunker import SentenceChunker, split_sentences
@@ -2262,7 +2729,24 @@ def check_sentence_splitting() -> None:
 
     # Naive splitting on ". " yields 8+ fragments here. We expect 4.
     assert len(sentences) == 4, f"expected 4 sentences, got {len(sentences)}: {sentences}"
-    logger.info("Sentence splitting handles legal abbreviations")
+
+    # A number legitimately ends a sentence. An earlier version treated any trailing
+    # digits-then-period as a section reference, which merged "$2,000,000." into the
+    # following sentence.
+    assert any(s.endswith("$2,000,000.") for s in sentences), (
+        "a sentence ending in a currency amount was wrongly merged forward"
+    )
+
+    # Punctuation must survive. Splitting with `re.split` on a pattern that includes
+    # closing quotes/brackets silently deletes them from the text.
+    quoted = 'The term "Agreement" is defined below. See Exhibit A (attached). It applies.'
+    parts = split_sentences(quoted)
+    rejoined = " ".join(parts)
+    for char in ('"', "(", ")"):
+        assert rejoined.count(char) == quoted.count(char), (
+            f"splitting lost {char!r}: {rejoined}"
+        )
+    logger.info("Sentence splitting preserves punctuation and handles abbreviations")
 
 
 def check_chunker_terminates() -> None:
@@ -2277,9 +2761,15 @@ def check_chunker_terminates() -> None:
 
     normal = SentenceChunker(max_tokens=400, overlap_sentences=2)
     produced = normal.split_text(text)
-    over_budget = [c for c in produced if count_tokens(c) > 400 * 1.1]
-    assert not over_budget, f"{len(over_budget)} chunks exceeded the token budget"
-    logger.info(f"Token budget respected across {len(produced)} chunks")
+
+    # A hard ceiling, with no tolerance. Summing per-sentence counts is only an
+    # estimate of the joined string's length, so the chunker re-checks the real count
+    # and sheds sentences until it fits. If this assertion needs a fudge factor, that
+    # verification step is missing.
+    over_budget = [(i, count_tokens(c)) for i, c in enumerate(produced)
+                   if count_tokens(c) > 400]
+    assert not over_budget, f"chunks exceeded the token ceiling: {over_budget}"
+    logger.info(f"Token ceiling respected exactly across {len(produced)} chunks")
 
 
 def check_end_to_end(sample_path: Path) -> None:
@@ -2323,23 +2813,67 @@ def check_end_to_end(sample_path: Path) -> None:
     assert len(ids) == len(set(ids)), "duplicate chunk_id — parents and children collided"
     logger.info("All chunk IDs unique")
 
+    # Deliberately NOT logging chunk text — roadmap §7.5 forbids putting document
+    # bodies in logs, and a contract is exactly the kind of content that rule exists
+    # for. Print shape, not content. Inspect the text interactively when you need to.
     if children:
-        sample = children[0]
-        logger.info(f"Example child ({sample.token_count} tokens): {sample.text[:200]}...")
+        sizes = sorted(c.token_count for c in children)
+        logger.info(
+            "Child token distribution",
+            extra={
+                "min": sizes[0],
+                "median": sizes[len(sizes) // 2],
+                "max": sizes[-1],
+            },
+        )
 
 
 def check_pipeline() -> None:
-    """Small parallel run. Confirms the multiprocessing path works end to end."""
+    """Small parallel run. Confirms the multiprocessing and commit path work end to end."""
     pipeline = IngestionPipeline(workers=2, batch_size=64)
     total = 0
     batches = 0
+
+    # Mirrors how Phase 3 will drive this: store, then commit. Here there is no store,
+    # so committing immediately simulates a successful write.
     for batch in pipeline.run(limit=20, resume=False):
         total += len(batch)
         batches += 1
+        committed = pipeline.commit()
+        assert committed == batch.document_count, (
+            f"commit recorded {committed} documents but the batch held "
+            f"{batch.document_count}"
+        )
+
     logger.info(f"Pipeline produced {total} chunks in {batches} batches")
     logger.info(f"Stats: {pipeline.stats.summary()}")
     logger.info(f"Quarantined: {pipeline.dlq.summary()}")
     assert total > 0, "pipeline produced no chunks at all"
+
+    # The DLQ counts each failure exactly once. An earlier version tallied in both
+    # `record()` and a separate merge step, doubling every failure rate.
+    assert pipeline.dlq.total == pipeline.stats.failed, (
+        f"dead-letter count {pipeline.dlq.total} disagrees with "
+        f"failed count {pipeline.stats.failed} — double counting"
+    )
+    logger.info("Failure accounting is consistent")
+
+
+def check_resume() -> None:
+    """A second run over the same files must skip everything and process nothing."""
+    pipeline = IngestionPipeline(workers=2, batch_size=64)
+    produced = 0
+    for batch in pipeline.run(limit=20, resume=True):
+        produced += len(batch)
+        pipeline.commit()
+
+    logger.info(f"Resume run: {pipeline.stats.summary()}")
+    assert pipeline.stats.processed == 0, (
+        "resume reprocessed documents that were already committed — check "
+        "should_skip_path and that commit() was called on the first run"
+    )
+    assert pipeline.stats.skipped > 0, "resume skipped nothing; the checkpoint is not loading"
+    logger.info("Resume correctly skipped previously committed documents")
 
 
 def main() -> None:
@@ -2361,6 +2895,7 @@ def main() -> None:
 
     check_end_to_end(samples[0])
     check_pipeline()
+    check_resume()
 
     logger.info("PHASE 2 VERIFIED — ingestion produces well-formed chunks.")
 
@@ -2395,12 +2930,22 @@ chunking that does not cut through clauses, a two-level hierarchy that decouples
 from generation context, resumable checkpointing, and a quarantine that turns thousands of failures
 into a diagnosable report.
 
-The three ideas worth carrying forward are: **stream, never accumulate** — the generator discipline is
+The four ideas worth carrying forward are: **stream, never accumulate** — the generator discipline is
 what makes corpus scale tractable at all; **`asyncio` for waiting, `multiprocessing` for computing** —
-confusing the two is the most common performance mistake in Python; and **quarantine, never crash and
-never silently skip** — at scale, failure is a category to be measured rather than an event to be
-prevented.
+confusing the two is the most common performance mistake in Python; **quarantine, never crash and never
+silently skip** — at scale, failure is a category to be measured rather than an event to be prevented;
+and **only the component that knows whether work succeeded may record it as done** — the reason
+`commit()` belongs to the consumer and not to this phase.
+
+There is a fifth, more uncomfortable lesson embedded in this file. Almost every correction made to it
+was a variant of the same mistake: *a filter or a shortcut whose failure mode was silent data loss*.
+Dropping short sections. Dropping short chunks. Deleting punctuation while splitting. Checkpointing
+before storing. Ignoring configuration changes. None of these crash, none appear in a log, and every one
+of them makes a document permanently unretrievable. When you write a filter, ask what happens to the
+data it rejects — and if the answer is "it disappears", make it loud or make it merge.
 
 **Next:** `Phase3_VectorStores_Embeddings.md` — dense and sparse embedding providers behind the async
 interface, and the Qdrant adapter using the modern `query_points` API with named vectors, payload
-indexes on `doc_id` and `chunk_level`, and the mandatory `delete_by_doc_id` before upsert.
+indexes on `doc_id` and `chunk_level`, and the mandatory `delete_by_doc_id` before upsert. It will also
+be rewritten to consume `ChunkBatch` and drive the `commit()` / `rollback()` contract — the version
+currently in `docs/` predates all of this and still exposes synchronous, dict-based interfaces.

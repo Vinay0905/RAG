@@ -2024,6 +2024,38 @@ class Telemetry:
                 else:
                     logger.debug(f"{name} completed in {elapsed:.1f}ms", extra=ctx)
 
+            # Order matters. A generator function is not a coroutine function, and
+            # timing one with the plain sync wrapper measures only how long it took to
+            # CREATE the generator object — effectively zero — not how long iterating
+            # it takes. Any pipeline stage written as a generator would silently report
+            # ~0ms. Check the generator forms first.
+            if inspect.isasyncgenfunction(func):
+                @functools.wraps(func)
+                async def async_gen_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    start = time.perf_counter()
+                    try:
+                        async for item in func(*args, **kwargs):
+                            yield item
+                    except BaseException as exc:
+                        _emit((time.perf_counter() - start) * 1000, True, exc)
+                        raise
+                    _emit((time.perf_counter() - start) * 1000, False)
+
+                return async_gen_wrapper  # type: ignore[return-value]
+
+            if inspect.isgeneratorfunction(func):
+                @functools.wraps(func)
+                def gen_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    start = time.perf_counter()
+                    try:
+                        yield from func(*args, **kwargs)
+                    except BaseException as exc:
+                        _emit((time.perf_counter() - start) * 1000, True, exc)
+                        raise
+                    _emit((time.perf_counter() - start) * 1000, False)
+
+                return gen_wrapper  # type: ignore[return-value]
+
             if inspect.iscoroutinefunction(func):
                 @functools.wraps(func)
                 async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -2114,6 +2146,14 @@ broad catch changes no semantics; it only guarantees the measurement is emitted.
 **Async functions report ~0.01ms.** You applied a sync-only decorator to a coroutine function. That
 is precisely the bug this file exists to prevent — if you see suspiciously instant async spans, check
 that `inspect.iscoroutinefunction` branch is present.
+
+**Generator functions report ~0ms.** The same failure in a different disguise, and the reason the
+`isgeneratorfunction` branch exists. Calling a generator function does not execute its body — it
+returns a generator object, and the body runs only as the caller iterates. So a sync wrapper times
+object *creation*. Phase 2's `IngestionPipeline.run()` is a generator that runs for hours, and without
+this branch it would report a fraction of a millisecond. Note also that the generator branches emit
+their span when iteration **completes**, so a caller that abandons the generator early never gets a
+span — that is unavoidable and worth knowing.
 
 **No timing output at all.** Successful spans log at `DEBUG`, and `LOG_LEVEL` defaults to `INFO`. Set
 `LOG_LEVEL=DEBUG` in `.env`. They are intentionally at DEBUG because a span per stage per request is
