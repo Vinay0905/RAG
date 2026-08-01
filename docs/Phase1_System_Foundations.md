@@ -1722,20 +1722,32 @@ class BaseMetric(ABC):
 
 This distinction is deliberate and reflects roadmap §7.2, so make sure it lands.
 
-`BaseEmbeddingProvider` methods are **sync**. Embedding runs an ONNX model on your CPU. There is no
-network call, nothing to await, and marking it `async` would be a lie that suggests concurrency is
-available where none is. Callers who must not block the event loop wrap it in `asyncio.to_thread`.
+`BaseEmbeddingProvider` methods are **async**, and this is the one that needs justifying, because the
+default implementation is CPU-bound. The rule is that **an interface is shaped by its most demanding
+implementation, not its simplest one.** FastEmbed runs an ONNX model on your CPU with nothing to
+await; if it were the only implementation, sync would be the honest signature. But the planned OpenAI
+embedding provider is a 100–500ms HTTP round trip, and a synchronous interface would force it to
+block the event loop — Phase 8's server would stop serving every other request for the duration. A
+caller cannot make a sync network call concurrent; an implementation *can* present a CPU-bound
+computation behind an async surface by offloading internally. So the interface is async, and the
+local provider delegates through `asyncio.to_thread` in one place (Phase 3's
+`LocalEmbeddingProvider`). The non-abstract `embed_dense_sync` is the escape hatch for callers that
+have no event loop at all, such as a multiprocessing worker.
 
 `BaseVectorStore` and `BaseLLMProvider` methods are **async**. Every call crosses a network boundary
 and spends nearly all its wall-clock time waiting. This is precisely what `async` is for: Phase 4
 issues three query variations concurrently with `asyncio.gather`, turning three sequential 200ms
 round trips into one 200ms wait.
 
-`BaseReranker.rerank` is **async despite being CPU-bound**, which looks like it contradicts the rule.
-It is a pragmatic exception: the reranker sits between two async stages in the graph, and forcing
-every caller to remember the `to_thread` wrapper invites the exact bug we are avoiding. Instead the
-implementation does it internally, once, correctly. The interface presents a uniform async surface;
-the messy detail is encapsulated. When you break a rule, break it in one place and document why.
+`BaseReranker.rerank` is **async for the same reason**, minus the network justification: the reranker
+sits between two async stages in the graph, and forcing every caller to remember the `to_thread`
+wrapper invites the exact bug we are avoiding. The implementation does it internally, once,
+correctly. The interface presents a uniform async surface; the messy detail is encapsulated.
+
+`BaseGuardrail.check` is **sync**, and that is the contrast that makes the rule visible. It is a
+regex match over a string — microseconds, no I/O, no plausible alternative implementation that
+blocks. Marking it async would add an await with nothing behind it. The test is not "is this work
+slow", it is "could any reasonable implementation of this interface need to wait".
 
 ### Failure Modes
 

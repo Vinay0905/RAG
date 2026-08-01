@@ -6,7 +6,7 @@
 > your next document must honour.
 >
 > Internal working file — not one of the study guides. Keep it updated at the end of every session.
-> Last updated: end of session 2 (2026-08-01).
+> Last updated: end of session 3 (2026-08-01).
 
 ---
 
@@ -64,13 +64,14 @@ the EDGAR corpus size forces.
 | File | Lines | State |
 | :--- | ---: | :--- |
 | `docs/00_MASTER_ROADMAP.md` | ~540 | ✅ current (corrected in session 2) |
-| `docs/Phase1_System_Foundations.md` | ~2,575 | ✅ current (rewritten + corrected + `ChunkLevel` added) |
-| `docs/Phase2_Ingestion_Engine.md` | ~2,400 | ✅ current (rewritten session 2) |
+| `docs/Phase1_System_Foundations.md` | ~2,625 | ✅ current (rewritten + corrected; async-embedding prose fixed session 3) |
+| `docs/Phase2_Ingestion_Engine.md` | ~2,950 | ✅ current (rewritten session 2) |
+| `docs/Phase3_VectorStores_Embeddings.md` | ~1,750 | ✅ current (rewritten session 3) |
 
 ### Still the OLD drafts — must be rewritten
-`Phase3_VectorStores_Embeddings.md`, `Phase4_Hybrid_Retrieval_Reranking.md`,
-`Phase5_LangGraph_Agent.md`, `Phase6_LLM_Cache_Guardrails.md`, `Phase7_LLMOps_Evaluation.md`,
-`Phase8_FastAPI_Server.md`, `Phase9_CLI_Web_UI.md`, `Phase10_Testing_Verification.md`.
+`Phase4_Hybrid_Retrieval_Reranking.md`, `Phase5_LangGraph_Agent.md`,
+`Phase6_LLM_Cache_Guardrails.md`, `Phase7_LLMOps_Evaluation.md`, `Phase8_FastAPI_Server.md`,
+`Phase9_CLI_Web_UI.md`, `Phase10_Testing_Verification.md`.
 **Phases 11–16 do not exist yet.**
 
 ### Reference only — superseded, do not delete, do not follow
@@ -79,19 +80,23 @@ the EDGAR corpus size forces.
 Where they conflict with a rewritten phase, **the phase wins**.
 
 ### ▶ IMMEDIATE NEXT ACTION
-Rewrite **`Phase3_VectorStores_Embeddings.md`**, then **`Phase4_Hybrid_Retrieval_Reranking.md`**.
-Phase 3 must cover, at minimum:
-- `src/embeddings/` — `base.py`, `fastembed_provider.py`, `openai_provider.py`, `factory.py`.
-  Async interface; FastEmbed implements `embed_dense_sync` for Phase 2's workers and has
-  `embed_dense` delegate to it via `asyncio.to_thread`.
-- `src/vectorstores/` — `base.py`, `qdrant_store.py`, `chroma_store.py`, `factory.py`.
-- `AsyncQdrantClient`, named vectors (`dense-bge` + `sparse-bm25`), `collection_exists()` +
-  `create_collection()` (**never** `recreate_collection`), payload indexes on **`doc_id`**,
-  **`chunk_level`**, `year`, `section_title`, batched upserts, and **`delete_by_doc_id`**.
-- Consume Phase 2's `IngestionPipeline.run()` generator of `ChunkBatch` objects, and **drive the
-  `commit()` / `rollback()` contract** — this is now a hard requirement, not a nicety.
-- The `Phase3_VectorStores_Embeddings.md` currently in `docs/` predates all of this: it still exposes
-  synchronous, dict-based interfaces and no delete-before-upsert. **Rewrite it, do not patch it.**
+Rewrite **`Phase4_Hybrid_Retrieval_Reranking.md`**, then **`Phase5_LangGraph_Agent.md`**
+(**verify LangGraph's current API by web search before writing Phase 5** — see §7).
+
+Phase 4 must honour, at minimum:
+- Consume `store.hybrid_search(dense_query, sparse_query, limit, filters)` from Phase 3. It returns
+  `list[ScoredChunk]`; access text as `scored.chunk.text`. `rerank_score` is `None` until the
+  reranker sets it, and `effective_score` falls back to `score`.
+- **Filter every search to `{"chunk_level": "child"}`, then substitute parents before generation**
+  (fetch parents by `parent_id`; they live in the same collection).
+- Only these filter fields are supported and unknown keys **raise**: `doc_id`, `chunk_level`,
+  `year`, `section_title`. Value shapes: scalar (exact), list (any), `{"gte":, "lte":}` (range).
+- Sparse *query* vectors come from `FastEmbedProvider.embed_sparse_query_sync(text)` — a
+  concrete-provider method, deliberately not on `BaseEmbeddingProvider`.
+- `PREFETCH_MULTIPLIER` already controls candidate depth inside the store; do not re-implement
+  fusion client-side. RRF happens server-side.
+- Files per the roadmap tree: `src/retrieval/` — `multi_query.py`, `hyde.py`, `fusion.py`,
+  `hybrid.py`, `rerankers/{base,cross_encoder,mmr}.py`, `pipeline.py`.
 
 ---
 
@@ -101,7 +106,7 @@ Phase 3 must cover, at minimum:
 | :-- | :--- | ---: |
 | 1 | System Foundations | 1,000 ✅ |
 | 2 | Ingestion at Scale | 1,600 ✅ |
-| 3 | Embeddings & Vector Stores | 800 |
+| 3 | Embeddings & Vector Stores | 1,450 ✅ |
 | 4 | Hybrid Retrieval & Reranking | 700 |
 | 5 | LangGraph Agent | 900 |
 | 6 | LLM, Cache & Guardrails | 700 |
@@ -241,6 +246,39 @@ a full scan).
 - Ingestion is sync + `multiprocessing` on purpose (GIL). Workers do CPU only and return picklable
   `Chunk` lists; the parent does all I/O. Windows **requires** `if __name__ == "__main__":`.
 
+### Phase 3 surface — now also frozen (written session 3)
+- `src/embeddings/base.py`: `DEFAULT_BATCH_SIZE`, `MAX_INPUT_TOKENS`, `batched()`,
+  `EmbeddingProviderBase` (`_prepare`, `_check_alignment`), `LocalEmbeddingProvider` (abstract
+  `embed_dense_sync` / `embed_sparse_sync` / `embed_query_sync`; the async trio delegates via
+  `asyncio.to_thread`).
+- `FastEmbedProvider` — module-level `get_dense_model()` / `get_sparse_model()` (`@lru_cache`, lazy,
+  per-process), `warmup()`, and the extra **`embed_sparse_query_sync(text) -> dict`** that Phase 4
+  needs. `dense_dimensions` is measured by a probe embedding, not a registry lookup, and raises
+  `DimensionMismatchError` against `DENSE_VECTOR_SIZE`.
+- `OpenAIEmbeddingProvider` — dense from the API, **sparse from local BM25** (no OpenAI sparse
+  endpoint; raising would silently kill hybrid search). `embed_dense_sync` stays unimplemented.
+- `get_embedding_provider()` is **`@lru_cache`d**; `get_vector_store()` is deliberately **not**
+  (a store owns a connection pool bound to an event loop; the caller owns the lifetime and closes it).
+- `src/vectorstores/base.py`: `DENSE_VECTOR_NAME = "dense-bge"`, `SPARSE_VECTOR_NAME = "sparse-bm25"`,
+  `PAYLOAD_INDEX_FIELDS`, `VectorStoreBase._validate_batch` / `_to_scored_chunks`.
+- `QdrantStore` extras beyond the interface: **`delete_by_doc_ids(seq)`** (batch; `delete_by_doc_id`
+  delegates to it), **`count_exact(filters)`**, **`set_bulk_mode(bool)`** (`indexing_threshold` 0 ↔
+  20 000 — leaving it on makes every search a brute-force scan), `_build_filter` (**unknown filter
+  keys raise** — silently ignoring one returns unfiltered results, which is a Phase 11 security hole).
+- Sparse field **must** be created with `models.Modifier.IDF`. FastEmbed's BM25 intentionally omits
+  the IDF term; without the modifier, lexical scoring silently ignores term rarity and nothing errors.
+- `upsert` uses `wait=True` — with `wait=False` the indexing pipeline would `commit()` writes that
+  are not durable.
+- **New package `src/pipelines/`** (not in the roadmap tree — update it). `IndexingPipeline` owns the
+  transaction: pull batch → `embed_dense` + `embed_sparse` concurrently → `delete_by_doc_ids` →
+  `upsert_points` → `commit()`, or `rollback()` + re-raise on failure. It pulls from Phase 2's sync
+  generator with `await asyncio.to_thread(next, batches, None)` (the sentinel avoids PEP 479's
+  "coroutine raised StopIteration") and calls `batches.close()` in a `finally`.
+- **Settings additions Phase 3 requires** (instruction is written into the doc; he must type them):
+  `VECTOR_STORE`, `UPSERT_BATCH_SIZE`, `PREFETCH_MULTIPLIER`, `CHROMA_PATH`, `EMBEDDING_PROVIDER`,
+  `OPENAI_EMBEDDING_MODEL`, `EMBEDDING_BATCH_SIZE`, plus two validators and two `validate_runtime()`
+  warnings.
+
 ---
 
 ## 7. EXTERNALLY VERIFIED FACTS (checked 2026-08-01 — re-verify if months have passed)
@@ -275,6 +313,17 @@ await client.query_points(
 Requires Qdrant **≥ 1.10** (Universal Query API). Prefetch limits must be ≥ main `limit + offset` or
 you get empty results. Prefetches can nest. **Deprecated — never use:** `client.search(...)`,
 `client.recreate_collection(...)`. Use `collection_exists()` + `create_collection()`.
+
+### FastEmbed (verified 2026-08-01)
+`TextEmbedding` (dense) and `SparseTextEmbedding` (sparse) expose `embed`, `query_embed`,
+`passage_embed`. Use `passage_embed` for documents and `query_embed` for queries — `bge` is
+asymmetric, and index/query must use the matching transformation. `Qdrant/bm25` is stemming +
+MurmurHash3 token hashing (~10 MB, no neural net) and **requires the IDF modifier on the Qdrant
+side**. All three methods return **generators** — materialise with `list(...)` immediately or the
+second use yields nothing. Dense results are `numpy` `float32` arrays; sparse results are
+`SparseEmbedding` with `.indices` / `.values`. Convert both to plain Python at the boundary.
+Deliberately avoided: `TextEmbedding.list_supported_models()` for dimensions — its entry shape
+(dict vs description object) has drifted between releases. Phase 3 probes with one embedding instead.
 
 ### Still to verify before writing
 - **LangGraph** (before Phase 5): current `StateGraph` construction, `add_conditional_edges`
@@ -361,6 +410,25 @@ All 17 findings were valid or partially valid. Fixed in place:
 > **THE SECOND LESSON:** nearly every one of these was *a filter or shortcut whose failure mode was
 > silent data loss*. When writing any filter, threshold, skip, or fast path, ask what happens to the
 > data it rejects. If the answer is "it disappears", make it loud or make it merge.
+
+### Session 3 notes (Phase 3)
+
+- **Found and fixed a leftover Phase 1 contradiction.** `interfaces.py`'s "Why some methods are async"
+  prose still claimed `BaseEmbeddingProvider` was sync — the exact error §8 recorded as corrected,
+  fixed in the code block but not in the paragraph 200 lines below it. Now rewritten to justify the
+  async choice, with `BaseGuardrail.check` as the sync contrast. **Lesson: when correcting a design
+  decision, grep the whole file for prose that restates it.** A corrected code block plus stale prose
+  is worse than either alone, because the reader cannot tell which one is current.
+- Phase 3 came in at ~1,450 lines against a budget of 800 — consistent with the 1.5–2× calibration.
+  The overrun is one unplanned file (`indexing_pipeline.py`, which the two-phase commit contract
+  forced) plus retry and schema-verification code. No features were added beyond the brief.
+- `_verify_schema` in `QdrantStore` is deliberately tolerant of introspection failure and says so in
+  its docstring. `CollectionInfo`'s nested shape varies by client version and nothing can be executed
+  here to confirm it; a schema check that crashes on an attribute access would be worse than one that
+  warns. A genuine dimension mismatch still raises when it is visible.
+- Scope kept out on purpose, and stated in the doc: quantisation (no measurement yet to justify the
+  recall trade — Phase 7 supplies it), and any retrieval policy (`chunk_level` filtering, parent
+  substitution) which belongs to Phase 4.
 
 ---
 
