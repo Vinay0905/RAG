@@ -966,7 +966,27 @@ class GraphExecutionError(RAGException):
 
 
 class MaxRetriesExceededError(GraphExecutionError):
-    """The self-correction loop exhausted its retry budget without a passing grade."""
+    """The agent loop terminated without producing any answer at all.
+
+    Deliberately NOT raised when the retry budget is exhausted with a *failing*
+    grade — that case returns the best answer with `status=LOW_CONFIDENCE`, its
+    `GradingReport` attached, and a caveat appended, because a partially-supported
+    answer plus an honest warning serves the user better than an HTTP 500. Phase 5
+    §2 argues this at length.
+
+    So this means "there is nothing to return": generation never succeeded, or a
+    routing bug hit the graph's recursion limit.
+    """
+
+
+class InvalidQueryError(RAGException):
+    """The request itself is malformed — blank query, non-positive top_k.
+
+    Separate from `RetrievalError` so a bad request cannot be reported as a
+    vector-store outage. Never retryable: sending the same empty string again
+    will fail identically.
+    """
+    status_code = 400
 
 
 # ─── Guardrails, evaluation, security ──────────────────────────────────────
@@ -1157,6 +1177,21 @@ class ChunkLevel(str, Enum):
     CHILD = "child"
     PARENT = "parent"
     SUMMARY = "summary"
+
+
+class AnswerStatus(str, Enum):
+    """How a run terminated. The machine-readable counterpart to `RAGAnswer.answer`.
+
+    Without this, a caller has to parse English prose to distinguish "no contract
+    matched" from "the search service is down" — the first is a 200 with an
+    explanation, the second is a 503 that should be retried. Phase 8 maps these to
+    HTTP status codes and Phase 9 renders them differently.
+    """
+    ANSWERED = "answered"              # generated and passed its audit
+    UNVERIFIED = "unverified"          # generated, but the audit did not run
+    LOW_CONFIDENCE = "low_confidence"  # generated, audited, and failed
+    NO_MATCH = "no_match"              # retrieval found nothing to answer from
+    UNSUPPORTED = "unsupported"        # a question top-k retrieval cannot answer
 
 
 class RetrievalMethod(str, Enum):
@@ -1352,6 +1387,12 @@ class RetrievalResult(BaseModel):
     total_candidates: int = Field(default=0, ge=0)
     latency_ms: float = Field(default=0.0, ge=0.0)
 
+    #: Search arms that failed. Phase 4 runs several probes concurrently and
+    #: tolerates partial failure — but a result assembled from two arms instead of
+    #: four is a DEGRADED result, and Phase 7 cannot attribute a poor answer without
+    #: knowing that. Logging it is not enough: logs are not joined to evaluations.
+    failed_arms: int = Field(default=0, ge=0)
+
     @computed_field
     @property
     def chunk_count(self) -> int:
@@ -1384,11 +1425,27 @@ class GradingReport(BaseModel):
     reasoning: str = Field(default="", max_length=2000)
     unsupported_claims: list[str] = Field(default_factory=list)
 
+    #: False when the audit did not actually run — the grader was disabled, errored,
+    #: or returned malformed output. This exists because the alternative is worse in
+    #: a specific and dangerous way: a fail-open fallback that sets
+    #: is_grounded=is_relevant=True makes `passed` True, and every caller that
+    #: checks `.passed` then treats an UNAUDITED answer as a verified one. The flag
+    #: is excluded from the model the LLM fills — the grader never sets it, only
+    #: our own code does.
+    verified: bool = Field(default=True, exclude=True)
+
     @computed_field
     @property
     def passed(self) -> bool:
-        """Both gates must clear. This drives the retry edge in Phase 5's graph."""
-        return self.is_grounded and self.is_relevant
+        """Audited, grounded, and relevant. Drives the retry edge in Phase 5.
+
+        `verified` is part of the conjunction on purpose: "we could not check this"
+        must never read the same as "we checked and it was fine". Phase 5
+        distinguishes the two when choosing whether to retry — an unverified answer
+        should not trigger a query rewrite, because rewriting the query does not
+        fix a broken grader.
+        """
+        return self.verified and self.is_grounded and self.is_relevant
 
 
 class RAGAnswer(BaseModel):
@@ -1404,6 +1461,19 @@ class RAGAnswer(BaseModel):
     cache_hit: bool = False
     total_latency_ms: float = Field(default=0.0, ge=0.0)
     created_at: datetime = Field(default_factory=_utc_now)
+
+    #: How this run ended, without parsing the prose. See `AnswerStatus`.
+    status: AnswerStatus = AnswerStatus.ANSWERED
+    #: Machine-readable detail behind a non-ANSWERED status, e.g.
+    #: "aggregation_not_supported". None when the run succeeded normally.
+    failure_reason: str | None = None
+    #: The graph thread this run used. Returned so a caller can resume or inspect
+    #: it later — an auto-generated ID the caller never sees is not resumable.
+    thread_id: str | None = None
+    #: Citation markers the model emitted that pointed at sources it was not given.
+    #: Non-zero means the answer's provenance is partly fabricated, which is worth
+    #: surfacing even though Phase 6 owns strict validation.
+    invalid_citations: int = Field(default=0, ge=0)
 ```
 
 ### The Theory: composition versus inheritance, and why `ScoredChunk` is built the way it is
@@ -1683,11 +1753,19 @@ class BaseReranker(ABC):
     @abstractmethod
     async def rerank(self, query: str, candidates: list[ScoredChunk],
                      top_k: int = 5) -> list[ScoredChunk]:
-        """Re-score and truncate.
+        """Re-score and truncate. Returns at most `top_k`, re-ranked from 0.
 
         Async despite being CPU-bound: implementations offload to
         `asyncio.to_thread` internally, so callers get a uniform await-able API.
-        Returned chunks must have `rerank_score` populated.
+
+        **`rerank_score` contract:** populate it when scoring actually happened;
+        leave it `None` when reranking was skipped or failed and the input order
+        was passed through. This is deliberately not "always populate" — writing
+        the retrieval score into `rerank_score` on a fallback would make a skipped
+        rerank indistinguishable from a completed one, and Phase 7 has to be able
+        to tell those apart to measure whether reranking earns its latency.
+        Callers therefore treat `rerank_score` as "reranked, if present" and sort
+        by `ScoredChunk.effective_score`, which handles both cases.
         """
 
 
@@ -1708,12 +1786,26 @@ class BaseLLMProvider(ABC):
 
     @abstractmethod
     async def generate_json(self, prompt: str, schema: type,
-                            system_prompt: str | None = None) -> Any:
+                            system_prompt: str | None = None,
+                            model: str | None = None) -> Any:
         """Completion constrained to JSON, validated against a Pydantic model.
 
-        This is how `GradingReport` is produced reliably — the provider is asked
-        for JSON mode and the result is parsed through Pydantic, so a malformed
-        grade raises rather than silently reading as a pass.
+        Returns an INSTANCE of `schema`, not a dict. Callers do
+        `report.is_grounded`, never `report["is_grounded"]`.
+
+        `model` overrides the provider's default, and it is not optional
+        decoration: Phase 4 expands queries with `EXPANSION_MODEL` and Phase 5
+        grades with `GRADER_MODEL` while generating with `GENERATION_MODEL`. One
+        provider instance serves all of them, so per-call model selection is the
+        only way that cost/quality split can exist. `generate` takes the same
+        argument for the same reason.
+
+        **Implementations MUST wrap every failure in an `LLMProviderError`
+        subclass — including Pydantic's `ValidationError` when the model returns
+        malformed JSON.** Phase 4's expander and Phase 5's grader, router, and
+        rewriter all degrade gracefully on `RAGException`; a bare `ValidationError`
+        escaping this method turns each of those documented fallbacks into an
+        unhandled crash.
         """
 
     @abstractmethod

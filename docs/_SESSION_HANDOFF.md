@@ -6,7 +6,7 @@
 > your next document must honour.
 >
 > Internal working file — not one of the study guides. Keep it updated at the end of every session.
-> Last updated: end of session 4 (2026-08-01).
+> Last updated: end of session 6 (2026-08-01).
 
 ---
 
@@ -64,15 +64,24 @@ the EDGAR corpus size forces.
 | File | Lines | State |
 | :--- | ---: | :--- |
 | `docs/00_MASTER_ROADMAP.md` | ~540 | ✅ current (corrected in session 2) |
-| `docs/Phase1_System_Foundations.md` | ~2,645 | ✅ current (async-embedding prose fixed s3; `fetch_by_ids` + reranker model name fixed s4) |
+| `docs/Phase1_System_Foundations.md` | ~2,680 | ✅ current (interface additions s4–s5) |
 | `docs/Phase2_Ingestion_Engine.md` | ~2,950 | ✅ current (rewritten session 2) |
-| `docs/Phase3_VectorStores_Embeddings.md` | ~1,790 | ✅ current (rewritten s3; `fetch_by_ids` added s4) |
-| `docs/Phase4_Hybrid_Retrieval_Reranking.md` | ~1,900 | ✅ current (rewritten session 4) |
+| `docs/Phase3_VectorStores_Embeddings.md` | ~2,050 | ✅ current (rewritten s3; **16-finding correction pass s5**) |
+| `docs/Phase4_Hybrid_Retrieval_Reranking.md` | ~2,200 | ✅ current (rewritten s4; **20-finding correction pass s6**) |
+| `docs/Phase5_LangGraph_Agent.md` | ~2,350 | ✅ current (rewritten s5; **22-finding correction pass s6**) |
+| `docs/Phase6_LLM_Cache_Guardrails.md` | ~2,050 | ✅ current (rewritten session 6) |
 
 ### Still the OLD drafts — must be rewritten
-`Phase5_LangGraph_Agent.md`, `Phase6_LLM_Cache_Guardrails.md`, `Phase7_LLMOps_Evaluation.md`,
-`Phase8_FastAPI_Server.md`, `Phase9_CLI_Web_UI.md`, `Phase10_Testing_Verification.md`.
+`Phase7_LLMOps_Evaluation.md`, `Phase8_FastAPI_Server.md`, `Phase9_CLI_Web_UI.md`,
+`Phase10_Testing_Verification.md`.
 **Phases 11–16 do not exist yet.**
+
+### External review files at repo root
+`IssuesinPhase3.md` (16), `IssuesinPhase4.md` (20), `Issuesinphase5.md` (22) — **all addressed**
+(s5 and s6; see §8). Leave the files; they are the record. **If a review file appears for a later
+phase, do the correction pass BEFORE writing new phases** — the Phase 4 sparse-query bug had already
+propagated from Phase 3 by the time it was caught, and the Phase 5 review found a Phase 6 interface
+mismatch that would have wasted a whole phase.
 
 ### Reference only — superseded, do not delete, do not follow
 `docs/01_ingestion_chunking_guide.md` … `docs/04_pipeline_production_guide.md`, `docs/answers.md`,
@@ -80,24 +89,26 @@ the EDGAR corpus size forces.
 Where they conflict with a rewritten phase, **the phase wins**.
 
 ### ▶ IMMEDIATE NEXT ACTION
-Rewrite **`Phase5_LangGraph_Agent.md`**, then **`Phase6_LLM_Cache_Guardrails.md`**.
+Rewrite **`Phase7_LLMOps_Evaluation.md`**, then **`Phase8_FastAPI_Server.md`**
+(**verify FastAPI + sse-starlette by web search before Phase 8** — see §7).
 
-**Before writing Phase 5, verify LangGraph by web search** (§7 lists what): current `StateGraph`
-construction, `add_conditional_edges` signature, `langgraph-checkpoint-sqlite` usage, recursion-limit
-handling. This is non-negotiable — LangGraph's API has churned more than anything else in the stack.
+Phase 7 is where every guessed threshold in Phases 4–6 becomes a measured one. It must:
+- Generate a synthetic QA set from the corpus (`src/evaluation/synthetic_generator.py`) — questions
+  with known source chunks, so retrieval can be scored without hand labelling.
+- Implement `BaseMetric` (Phase 1: `name` property, async `score(query, answer, contexts)`) in
+  `src/evaluation/metrics/{groundedness,relevance,context_recall}.py`.
+- Read the fields that exist *specifically* so this phase could exist: `PROMPT_VERSION`,
+  `RetrievalResult.failed_arms` and `.total_candidates`, `ScoredChunk.rerank_score` vs `.score`,
+  `GradingReport.verified` and `.confidence`, `RAGAnswer.status` and `.invalid_citations`.
+- Answer the open questions the earlier phases deliberately deferred: does HyDE earn its latency on
+  this corpus (`ENABLE_HYDE` defaults false); does MMR help or hurt (`ENABLE_MMR` defaults false);
+  RRF vs DBSF fusion; what `CACHE_SIMILARITY_THRESHOLD` is actually safe; does the cross-encoder
+  change the top result often enough to justify 20ms (`top_changed` is already logged).
+- `src/evaluation/regression.py` — fail a run when a metric drops versus a stored baseline.
 
-Phase 5 must honour:
-- **Phase 4's optional-LLM trick does not extend to Phase 5.** A generation node cannot degrade to
-  "no LLM". Either write Phase 6 first, or define the nodes against `BaseLLMProvider` and make the
-  *graph* the thing Phase 6 completes. Decide explicitly and say which in the doc.
-- State is a **TypedDict** (`StateGraph(AgentState)`, never `StateGraph(dict)`).
-- `RetrievalPipeline.retrieve(query, top_k, filters) -> RetrievalResult` is the retrieval node's
-  entire surface. Do not reach past it into the store or the reranker.
-- `GradingReport.passed` (= `is_grounded and is_relevant`) drives the retry edge;
-  `settings.MAX_RETRIES` bounds it; exhaustion raises `MaxRetriesExceededError`.
-- Sources reaching generation are **parents** (`chunk_level == PARENT`) with the parent's
-  `chunk_id` — so `Citation.chunk_id` must match the parent, not the child that was retrieved.
-- Prompts all live in `src/graph/prompts.py`. Never log a generated answer or a source body (§7.5).
+**Scope warning:** Phases 3–6 all came in at ~1.7–2× budget and the total is now ~7,300 lines of
+Python against a 10,000-line target with ten phases left. §4's instruction applies from here on: **cut
+features rather than exceed budget.** Phase 7's budget is 600.
 
 ---
 
@@ -109,8 +120,8 @@ Phase 5 must honour:
 | 2 | Ingestion at Scale | 1,600 ✅ |
 | 3 | Embeddings & Vector Stores | 1,450 ✅ |
 | 4 | Hybrid Retrieval & Reranking | 1,200 ✅ |
-| 5 | LangGraph Agent | 900 |
-| 6 | LLM, Cache & Guardrails | 700 |
+| 5 | LangGraph Agent | 1,250 ✅ |
+| 6 | LLM, Cache & Guardrails | 1,350 ✅ |
 | 7 | LLMOps & Evaluation | 600 |
 | 8 | FastAPI Async Server | 600 |
 | 9 | CLI & Web Dashboard | 650 |
@@ -247,6 +258,41 @@ a full scan).
 - Ingestion is sync + `multiprocessing` on purpose (GIL). Workers do CPU only and return picklable
   `Chunk` lists; the parent does all I/O. Windows **requires** `if __name__ == "__main__":`.
 
+### ⚠️ INTERFACE + MODEL CHANGES made in session 6 (from the Phase 4 and 5 reviews)
+All in Phase 1, all additive except where noted. Phase 1's guide is updated.
+- **`BaseLLMProvider.generate_json(..., model: str | None = None)`** — the parameter did not exist, so
+  `EXPANSION_MODEL` and `GRADER_MODEL` were **unused settings** and every call ran on the generation
+  model. Both reviews found this independently. Its docstring now also *requires* implementations to
+  wrap `ValidationError` in `LLMProviderError`.
+- **`GradingReport.verified: bool = Field(default=True, exclude=True)`** and `passed` now means
+  `verified and is_grounded and is_relevant`. Fixes the worst bug found: the grader's fail-open path
+  set grounded+relevant True, so `passed` was True and **a grader outage silently marked every answer
+  verified**. `exclude=True` keeps it out of the LLM's schema so a model cannot declare its own audit.
+- **`AnswerStatus` enum** (`ANSWERED | UNVERIFIED | LOW_CONFIDENCE | NO_MATCH | UNSUPPORTED`) and
+  `RAGAnswer.status`, `.failure_reason`, `.thread_id`, `.invalid_citations`. Callers were being made to
+  parse English prose to tell "no contract matched" from "the vector store is down".
+- **`RetrievalResult.failed_arms: int = 0`** — partial search failure existed only in logs.
+- **`InvalidQueryError(RAGException)`, status 400** — a blank query was reaching the store and being
+  reported as a *retryable* retrieval outage.
+- **`MaxRetriesExceededError` docstring rewritten** to match Phase 5's actual behaviour (raised only
+  when there is no answer at all), and **`BaseReranker.rerank`'s postcondition weakened deliberately**:
+  `rerank_score` is populated when scoring happened and left `None` on a fallback, so "skipped" stays
+  distinguishable from "reranked". The contract now matches the better behaviour instead of the reverse.
+
+### ⚠️ INTERFACE CHANGES made in session 5 (from the Phase 3 review)
+Three edits to `src/core/interfaces.py`. Phase 1's guide is already updated; if he typed it earlier he
+must patch it.
+- **`BaseVectorStore.delete_by_doc_ids(doc_ids)` is now the abstract method** and
+  `delete_by_doc_id(doc_id)` is a concrete wrapper delegating to it. Previously only the singular was
+  declared while `IndexingPipeline` called the plural — a type error and an unimplementable contract
+  for any new store.
+- **`BaseEmbeddingProvider.embed_sparse_query(text) -> dict[str, list]`** added as abstract. Was a
+  concrete-only `FastEmbedProvider` method, which meant the OpenAI provider could not serve Phase 4 at
+  all. **Phase 4's `embed_probe` was using document-side `embed_sparse` for queries** — mis-weighted
+  BM25 that still returns results, so invisible. Fixed.
+- **`BaseEmbeddingProvider.close()`** added as a non-abstract no-op. The OpenAI provider owns an
+  `AsyncOpenAI` pool; callers close unconditionally without branching on provider type.
+
 ### ⚠️ INTERFACE ADDITION made in session 4 — `BaseVectorStore.fetch_by_ids`
 `async fetch_by_ids(ids: Sequence[str]) -> list[Chunk]`. Additive only; nothing existing changed.
 Needed because `chunk_id` is **not** a filterable field, so Phase 4's parent substitution (and
@@ -359,6 +405,96 @@ you get empty results. Prefetches can nest. **Deprecated — never use:** `clien
   `cross-encoder/ms-marco-MiniLM-L-6-v2` is the sentence-transformers name and FastEmbed rejects it.
   Fixed in both the settings block and `.env.example`.
 
+### Phase 5 surface — frozen (written session 5)
+- `src/graph/`: `state.py` (`AgentState` TypedDict, `initial_state()`), `prompts.py`
+  (`PROMPT_VERSION`, all prompt constants), `edges.py` (`after_router`, `after_retrieval`,
+  `after_grading`, `after_rewrite` — all **pure functions of state**), `builder.py`
+  (`build_graph`, `RAGAgent.answer -> RAGAnswer`), `nodes/{router,retrieval,generation,grading,
+  rewriting}_node.py`.
+- **`expansion_node.py` and `reranking_node.py` from the roadmap tree are deliberately NOT created** —
+  Phase 4's `RetrievalPipeline` owns that orchestration. The graph keeps only the *decision*
+  (`router_node` sets `expand`). Update the roadmap tree.
+- `AgentState` uses `Annotated[list, operator.add]` reducers for `trace` and `attempts`. **Nodes
+  return partial dicts and must return only their own contribution to a reduced key** — returning the
+  accumulated list re-appends it.
+- **Two loop budgets, both required:** `settings.MAX_RETRIES` (semantic, in state, drives the grading
+  edge) and LangGraph's `recursion_limit` (structural, catches a bug in our own edges). `RAGAgent`
+  sets `recursion_limit = 4 * (MAX_RETRIES + 1) + 6` so an edge bug fails in a second, not after 1000
+  steps.
+- **`MaxRetriesExceededError` is raised ONLY when no answer exists at all.** A poor answer is returned
+  with its `GradingReport` attached and `LOW_CONFIDENCE_CAVEAT` appended — decided explicitly; see the
+  argument in Phase 5 §2.
+- Generation answers `state["query"]` (the original), while retrieval searches
+  `state["current_query"]` (possibly rewritten). Getting that backwards answers a question nobody
+  asked.
+- `rewriting_node` is the **sole owner** of `retry_count`, and sets it to `MAX_RETRIES` to stop the
+  loop when a rewrite makes no progress.
+- Empty retrieval routes to a `no_context` node and **never reaches generation**. Aggregate queries
+  (`router` → `unsupported`) are refused with an explanation — Phase 12 fills that branch.
+- Phase 4 gained `RetrievalPipeline.retrieve(..., expand: bool = True)` for the router to drive.
+- `scripts/verify_phase5.py` needs **no API key**: a `ScriptedLLM` supplies canned answers/grades, so
+  the failing-grade retry path is deterministically testable. Reuse this pattern in Phase 10.
+
+### Phase 6 surface — frozen (written session 6)
+- `src/llm/`: `model_resolver.py` (`GROQ_DEPRECATIONS`, `resolve_model`, `check_configured_models`,
+  `verify_models_live`), `base.py` (`to_strict_schema`, `LLMProviderBase`), `groq_provider.py`
+  (`GroqProvider`), `openai_provider.py`, `factory.py` (`get_llm_provider` — **not** cached).
+- `src/cache/`: `redis_cache.py` (`make_cache_key`, `RedisAnswerCache`), `semantic_cache.py`
+  (`SemanticAnswerCache`, `semantically_incompatible`).
+- `src/guardrails/`: `citation_validator.py` (`CitationValidator`, `CitationReport`,
+  `strip_fabricated`), `prompt_injection.py` (`PromptInjectionGuard`, `neutralise_document`),
+  `pii_masker.py` (`mask_pii`, `safe_for_log`).
+- **`src/app.py` → `RAGService`** is the composition root: guard → cache → `RAGAgent.answer` →
+  citation validator → cache write. Phase 8's routes depend on this one object.
+- **`to_strict_schema` is mandatory, not a nicety.** Groq's `strict: true` requires EVERY property in
+  `required` and `additionalProperties: false`; `model_json_schema()` provides neither (Pydantic omits
+  defaulted fields from `required`). Passing the raw schema 400s, and the natural wrong conclusion is
+  "strict mode does not work". It also drops `Field(exclude=True)` fields, which is what keeps
+  `GradingReport.verified` out of the model's reach.
+- `make_cache_key` includes **`PROMPT_VERSION`** — without it, editing a prompt has no effect on any
+  cached question and the fix looks broken. Only `ANSWERED` answers are cached (`CACHE_MIN_STATUS`).
+- **The semantic cache raises its own threshold floor to 0.97**, overriding Phase 1's 0.92 default,
+  and applies a deterministic `semantically_incompatible` veto (entity swaps, differing numbers,
+  negation). "buyer may terminate" vs "seller may terminate" is ~0.97 cosine with opposite answers.
+- **Prompt injection is checked in BOTH directions.** Queries are rejected; retrieved document text is
+  **neutralised, never dropped** — dropping would let an adversary hide a clause by making it look
+  like an attack. Indirect injection via corpus text is the real threat, not user-side injection.
+- **PII masking deliberately does NOT touch retrieved sources.** In a contract system party names and
+  amounts are the answer; masking them is a compliance win and a product failure. It covers queries
+  and log lines only.
+
+### Groq (verified 2026-08-01 — TIME-CRITICAL)
+- Production models: `openai/gpt-oss-120b` ($0.15/$0.60 per 1M), `openai/gpt-oss-20b` ($0.075/$0.30),
+  `whisper-large-v3`, `whisper-large-v3-turbo`. The `.env` values are correct.
+- **`llama-3.1-8b-instant` and `llama-3.3-70b-versatile` shut down 2026-08-16** → `openai/gpt-oss-20b`
+  and `openai/gpt-oss-120b` (or `qwen/qwen3.6-27b`). Enterprise committed-spend accounts exempt.
+- Structured outputs: `response_format={"type":"json_schema","json_schema":{"name":..., "strict":True,
+  "schema":...}}`. `strict:True` gives 100% compliance via constrained decoding on gpt-oss models.
+  **Streaming and tool use are NOT supported with structured outputs.** `{"type":"json_object"}` is the
+  best-effort mode.
+- `AsyncGroq(api_key=..., timeout=...)`. Live model list: `GET https://api.groq.com/openai/v1/models`
+  (also `client.models.list()`).
+- Preview models worth knowing about but NOT for production: `openai/gpt-oss-safeguard-20b`,
+  `meta-llama/llama-prompt-guard-2-86m` (a purpose-built injection classifier — a possible upgrade
+  over Phase 6's regexes if it ever reaches production status).
+
+### LangGraph (verified 2026-08-01 — re-verify if months have passed)
+`from langgraph.graph import END, START, StateGraph`; `from langgraph.errors import
+GraphRecursionError`. `StateGraph(AgentState)` with a TypedDict, **never** `StateGraph(dict)`.
+`add_node(name, fn)` accepts `async def`. `add_conditional_edges(source, path_fn, path_map)` where
+`path_map: dict[Hashable, str]` is optional but preferred (declares destinations at build time).
+`compile(checkpointer=...)`. Run with `await graph.ainvoke(state, config)`; stream with `astream`.
+- **`recursion_limit` is a TOP-LEVEL config key, NOT inside `configurable`.** Wrong placement is
+  silently ignored. Default is 1000 (since 1.0.6).
+- `thread_id` goes in `config["configurable"]` and is **required** when a checkpointer is set.
+- `AsyncSqliteSaver.from_conn_string(path)` from `langgraph.checkpoint.sqlite.aio` is an **async**
+  context manager; the sync `SqliteSaver` would block the loop on every super-step. `InMemorySaver`
+  lives in `langgraph.checkpoint.memory`.
+- **Checkpoints are written at super-step boundaries, not inside nodes** — a resumed run re-runs the
+  interrupted node from the start of its function, so side effects (paid LLM calls) repeat.
+- Reducers: `Annotated[list[str], operator.add]`. Also available: `langgraph.types.Send` (Phase 12
+  map-reduce), `Command`, `interrupt`, `langgraph.managed.RemainingSteps`.
+
 ### FastEmbed rerankers (verified 2026-08-01)
 `from fastembed.rerank.cross_encoder import TextCrossEncoder`;
 `TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2")`; `list(encoder.rerank(query, docs))`
@@ -379,9 +515,11 @@ Deliberately avoided: `TextEmbedding.list_supported_models()` for dimensions —
 (dict vs description object) has drifted between releases. Phase 3 probes with one embedding instead.
 
 ### Still to verify before writing
-- **LangGraph** (before Phase 5): current `StateGraph` construction, `add_conditional_edges`
-  signature, checkpointer/`langgraph-checkpoint-sqlite` usage, recursion-limit handling.
-- **FastAPI / sse-starlette** (before Phase 8): current SSE + lifespan patterns.
+- **FastAPI / sse-starlette** (before Phase 8): current SSE + lifespan patterns. Also note Phase 5
+  §11's streaming-versus-grading tension — you cannot un-stream an ungrounded answer, and the
+  recommendation there is to stream `AgentState.trace` rather than answer tokens.
+- **Groq** — re-verify the deprecation table in `src/llm/model_resolver.py` if the date is anywhere
+  near or past 2026-08-16. A stale deprecation table is worse than none, because it is trusted.
 
 ---
 
@@ -507,6 +645,144 @@ All 17 findings were valid or partially valid. Fixed in place:
   ~80% of retrieval latency and both happen before any search starts.** Everything Phases 3 and 4
   built lives inside a ~200ms envelope. That is the justification for Phase 5's router node and
   Phase 6's semantic cache, and it is the number to quote when asked what to optimise.
+
+### Session 5 — the Phase 3 correction pass (external review, `IssuesinPhase3.md`, 16 findings)
+
+**All 16 were valid or partially valid.** Fixed in place. The ones worth remembering:
+
+- **Interface incompleteness (2 findings).** `delete_by_doc_ids` and `embed_sparse_query` existed only
+  on concrete classes while callers typed against the ABC. Both promoted — see the interface-changes
+  box above. The second one had already propagated into Phase 4 as a real bug.
+- **"Stateless providers" was false** (finding 3). The factory prose claimed caching was safe because
+  providers hold no connection state, two sentences from a class that owns an `AsyncOpenAI` pool.
+  Rewritten to state the actual trade, plus `close()` on the base and in `index_corpus.py`.
+- **`_retry` retried permanent failures** (4). Now classifies: 4xx raises immediately, non-retryable,
+  with a per-status hint; only transport failures and 5xx retry. Marking a bad API key `retryable=True`
+  would have told Phase 8 to keep trying it.
+- **Two swallowed-exception bugs, both my own second lesson violated** (5, 7). Payload-index creation
+  suppressed *all* errors as "probably already exists" — now it reads `payload_schema`, creates only
+  what is missing, and raises. And `_set_bulk_mode` swallowed failures in **both** directions; leaving
+  bulk mode on makes every search a brute-force scan, so leaving it is now a retried, raising
+  operation (`_restore_bulk_mode`) while *entering* it stays best-effort. **Asymmetric operations need
+  asymmetric error handling.**
+- **Schema verification conflated two different things** (6). "I could not read the schema" (tolerate,
+  warn — client shapes drift) versus "I read it and it is wrong" (raise). The first draft warned for
+  both. Missing named vector, wrong dimension, wrong distance metric, missing sparse field now all
+  raise.
+- **Chroma silently dropped range/list filters** (8) — the same failure the Qdrant store raises on, and
+  a Phase 11 security hole. Now raises. Chroma *could* support `$gte`/`$in`; deliberately not
+  implemented, because unused translation code is untested translation code.
+- **Cancellation race in the sync-generator bridge** (9). `asyncio.to_thread` **cannot be cancelled** —
+  the worker thread keeps running inside `next(batches)` while the `finally` calls `close()`, giving
+  `ValueError: generator already executing` and orphaned worker processes. Fixed with a
+  `threading.Lock` shared by `_pull` and `_close`, with the close itself run in a thread.
+- **Duplicate `chunk_id`s inside one batch** (12) would silently overwrite while `upsert_points`
+  reported the full count. Now raises, alongside a sparse indices/values length check.
+- **The verification script had a parent/child ID collision** (13) that made `check_filters` pass while
+  testing nothing — parents at index 0 overwrote children at index 0. Now uses Phase 2's 1,000,000
+  offset. Also: unique temp collection name (14, it deleted a fixed name unconditionally), a missing
+  return annotation (15), a query-vs-document sparse assertion, and a new `check_transaction` that
+  tests commit/rollback with stubs and no Qdrant (16).
+
+> **THE THIRD LESSON:** every one of findings 1, 2, 5, 7, 8, and 12 is the **same mistake in six
+> places** — an error path that continues as though nothing happened. I wrote the lesson about this at
+> the end of session 2 ("if the answer is 'it disappears', make it loud"), then violated it six times
+> in one file. Writing a lesson down is not the same as applying it. Before finishing any file, grep it
+> for `except` and for every filter, and ask what the caller learns when that path is taken.
+
+### Session 5 notes (Phase 5)
+
+- **Wrote the phase against `BaseLLMProvider` with a `ScriptedLLM` in the verification.** This is
+  better than waiting for Phase 6, and not only for sequencing: scripting a *failing grade* is the only
+  way to test the retry path deterministically. The unhappy path works because it is the easy one to
+  test this way.
+- **Two roadmap nodes deliberately not built** (`expansion_node`, `reranking_node`) because Phase 4
+  already owns that orchestration. Recorded in the frozen-surface box.
+- **Argued against raising on a poor answer.** `MaxRetriesExceededError` fires only when there is no
+  answer at all; a partially-supported answer is returned with its grading and a caveat. If this is
+  revisited later, the reasoning is in Phase 5 §2 — read it before changing it.
+- The §8 discussion of self-grading bias is the most interview-relevant passage in the phase: what
+  actually mitigates it (extractive task, demand named unsupported claims, different model, confidence
+  floor) versus what is theatre (1–10 scores, chain-of-thought before a boolean, majority of two
+  correlated samples).
+
+### Session 6 — the Phase 4 and 5 correction passes (42 findings across two reviews)
+
+Both reviews were substantially correct. Everything material is fixed. The findings worth carrying
+forward as lessons:
+
+**The composition bug (Phase 4 #1) is the most instructive of the whole project.** The cross-encoder
+truncated to `final_k`; MMR short-circuits when `len(candidates) <= top_k`; so **enabling MMR did
+absolutely nothing.** Two individually correct components composed into a no-op, and a direct unit test
+of MMR passed happily while the pipeline ignored it. Fixed with `MMR_POOL_MULTIPLIER` (rerank to
+`top_k × 3`, then diversify to `top_k`) plus a `check_mmr_composition` test that exercises the *real*
+pipeline. **Generalisation: a stage that both scores and truncates has two responsibilities, and the
+truncation is the one that breaks composition. Only the last selector in a chain may cut to the final
+size.**
+
+**The unverified-grade bug (Phase 5 #3) was the most dangerous.** The grader's fail-open path set
+`is_grounded=is_relevant=True`, making `passed` True, so every caller checking `.passed` treated an
+*unaudited* answer as verified — a grader outage silently upgraded the entire system. Fixed with
+`GradingReport.verified`, a separate `UNVERIFIED` status, a distinct caveat, and an edge branch that
+does not retry (rewriting the query cannot fix a broken grader).
+
+**Unused settings that read as implemented features.** `EXPANSION_MODEL` and `GRADER_MODEL` were never
+passed, because `generate_json` had no `model` parameter — so the documented cost/quality split was
+prose. Both reviews found it. **Lesson: when a doc claims a setting has an effect, trace the value to
+its use site before shipping the claim.**
+
+**Diagnostics that lived only in logs.** `SearchOutcome.failed_queries`, the HyDE arm's candidate
+contribution, the invalid-citation count, and per-attempt grades were all logged and then dropped.
+Phase 7 reads results, not logs. All four are now returned data. **Lesson: if a later phase needs a
+number, logging it is the same as discarding it.**
+
+**Errors classified by convenience rather than cause.** A generation outage raised
+`MaxRetriesExceededError`; a retrieval outage was returned as friendly prose; a blank query surfaced as
+a retryable vector-store failure. All three produce the wrong HTTP status and send someone to the wrong
+component. Now: `InvalidQueryError` (400), `LLMProviderError`, `RetrievalError` (503, retryable), and
+`AnswerStatus` for the non-exceptional cases.
+
+**Smaller but real:** `\b§` never matches (word boundary before a non-word char), so the advertised
+`§ 3.1(b)` route was dead; `"count" in query` matched "account" and "discount"; a retry reused the
+router's original *skip expansion* decision even though the failed grade was evidence that broader
+retrieval was needed; `_is_progress` documented a four-word minimum and enforced two; the cross-encoder
+reserved a fixed 96 tokens for the query instead of measuring it; `_apply_budget` claimed a token
+ceiling it did not enforce; the cross-encoder loaded even when reranking was disabled; only the
+*concrete* reranker caught its own failures, so a different `BaseReranker` could abort retrieval;
+`isinstance(item, BaseException)` swallowed `CancelledError` as a failed search arm; and RRF hardcoded
+`method=HYBRID`, relabelling Chroma's dense-only results.
+
+> ### ⚠️ THE FOURTH LESSON
+> Three reviews, ~54 findings, and the recurring shape is now clear: **the code was usually right and
+> the CLAIMS around it were wrong.** A docstring promising a ceiling the method did not enforce; a
+> comment describing MMR diversifying reranked results while the code recomputed cosine relevance; a
+> settings block implying per-task models; an interface postcondition the implementation deliberately
+> violated for good reasons. Session 2's lesson was "weaken the claim to what the code guarantees" —
+> that is still the right lesson, and it needs a mechanical form: **for every claim in a docstring or
+> comment, name the line that makes it true. If you cannot, the claim is a wish.**
+
+### Session 6 notes (Phase 6)
+
+- **Did the correction passes before writing Phase 6, and it paid for itself immediately.** The Phase 5
+  review's #1 finding was that the *old* Phase 6 draft defined a second, synchronous
+  `BaseLLMProvider` — so "Phase 6 substitutes Groq and changes nothing else" would have failed
+  structurally. Writing Phase 6 first would have wasted the phase.
+- **`to_strict_schema` is the highest-value 30 lines in the phase** and appears in no plan. Groq's
+  strict mode requires every property in `required` and `additionalProperties: false`; Pydantic
+  provides neither. The naive implementation 400s, and the natural conclusion is "strict mode doesn't
+  work, use json_object" — which quietly removes the guarantee that eight fail-open paths across
+  Phases 4 and 5 depend on staying dormant.
+- **Two files not in the roadmap tree:** `model_resolver.py` and `src/app.py` (`RAGService`). The
+  resolver is justified by a shutdown date fifteen days out; the composition root is justified by
+  Phase 8 needing one object rather than seven.
+- **PII masking scope was cut deliberately** and the reasoning is in the doc: masking retrieved
+  contract text would produce "[PERSON_1] shall indemnify [ORG_2]", which satisfies a checkbox and
+  destroys the product. It covers queries and logs only. This is the kind of feature reduction §4 asks
+  for.
+- The semantic cache section is the most interview-ready material in the phase: **a cache that can
+  return the wrong answer is not a cache, it is a bug with a latency benefit.** Cosine similarity
+  encodes topic, not logical content, so one swapped entity moves the vector ~0.03 and inverts the
+  answer.
 
 ---
 

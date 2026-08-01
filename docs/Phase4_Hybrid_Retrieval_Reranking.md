@@ -172,6 +172,16 @@ Add to the **RAG hyperparameters** block:
         le=1.0,
         description="1.0 = pure relevance, 0.0 = pure diversity.",
     )
+    MMR_POOL_MULTIPLIER: int = Field(
+        default=3,
+        ge=2,
+        le=10,
+        description=(
+            "When MMR is enabled, the cross-encoder reranks to top_k x this, and MMR "
+            "selects the final top_k from that pool. Without a wider pool MMR receives "
+            "exactly as many candidates as slots and does nothing — see §9."
+        ),
+    )
     MAX_CONTEXT_TOKENS: int = Field(
         default=12_000,
         ge=1000,
@@ -205,6 +215,7 @@ ENABLE_MMR=false
 ENABLE_PARENT_SUBSTITUTION=true
 RRF_K=60
 MMR_LAMBDA=0.7
+MMR_POOL_MULTIPLIER=3
 MAX_CONTEXT_TOKENS=12000
 ```
 
@@ -280,10 +291,11 @@ the model returns "Sure! Here are three variations:" as line one, and then you s
 expansion that replaces it can only lose information.
 
 ```python
+import asyncio
+
 from pydantic import BaseModel, Field
 
 from config.settings import settings
-from src.core.exceptions import RAGException
 from src.core.interfaces import BaseLLMProvider
 from src.core.logging import logger
 from src.core.telemetry import telemetry
@@ -361,8 +373,22 @@ class QueryExpander:
                 ),
                 schema=QueryVariations,
                 system_prompt=_SYSTEM_PROMPT,
+                # Actually use EXPANSION_MODEL. The first draft stored `self.model`
+                # and never passed it, so the setting was decoration and expansion
+                # silently ran on whatever model the provider defaulted to — the
+                # expensive one.
+                model=self.model,
             )
-        except RAGException as exc:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Catches Exception, not just RAGException. The provider contract says
+            # every failure — including Pydantic's ValidationError on malformed
+            # JSON — is wrapped in an LLMProviderError, but a "never raises"
+            # guarantee that depends on every future provider honouring that
+            # perfectly is not a guarantee. This is one of the few places where a
+            # bare `except Exception` is right, because the fallback is genuinely
+            # correct and the failure is logged with its type.
             logger.warning(
                 "Query expansion failed; falling back to the original query",
                 extra={"error": type(exc).__name__},
@@ -475,8 +501,9 @@ register gap, because "termination for convenience" *is* the document's language
 whether it earns its latency here.
 
 ```python
+import asyncio
+
 from config.settings import settings
-from src.core.exceptions import RAGException
 from src.core.interfaces import BaseLLMProvider
 from src.core.logging import logger
 from src.core.telemetry import telemetry
@@ -534,7 +561,11 @@ class HyDEGenerator:
                 max_tokens=self.max_tokens,
                 model=self.model,
             )
-        except RAGException as exc:
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # See the note in `QueryExpander.expand` — the fallback is correct for
+            # any failure, so the catch is deliberately broad and the type is logged.
             logger.warning("HyDE generation failed", extra={"error": type(exc).__name__})
             return None
 
@@ -691,7 +722,15 @@ class HybridRetriever:
 
         outcome = SearchOutcome()
         for query, item in zip(queries, raw, strict=True):
-            if isinstance(item, BaseException):
+            # CancelledError is a BaseException, not an Exception, and it is not a
+            # failed search — it is the caller shutting us down. Treating it as a
+            # degraded arm swallows the cancellation, lets the request continue,
+            # and makes a graceful shutdown hang for no visible reason. The same
+            # applies to KeyboardInterrupt and SystemExit.
+            if isinstance(item, BaseException) and not isinstance(item, Exception):
+                raise item
+
+            if isinstance(item, Exception):
                 outcome.failed_queries += 1
                 logger.warning(
                     "One retrieval arm failed",
@@ -917,7 +956,13 @@ def reciprocal_rank_fusion(
                 chunk=original.chunk,
                 score=score,
                 rank=new_rank,
-                method=RetrievalMethod.HYBRID,
+                # Preserve what the STORE reported rather than asserting HYBRID.
+                # The first draft hardcoded HYBRID, which relabelled Chroma's
+                # dense-only results — and Qdrant's own dense-only fallback for an
+                # empty sparse query — as hybrid. Phase 7 compares retrieval
+                # methods; a field that always says the same thing is worse than
+                # absent, because it looks like evidence.
+                method=original.method,
                 # Deliberately NOT carried over. Nothing has been reranked yet, and
                 # a stale rerank_score would make `effective_score` sort by a
                 # previous query's cross-encoder output.
@@ -1004,11 +1049,17 @@ from src.core.models import ScoredChunk
 from src.core.utils import count_tokens, truncate_to_tokens
 
 #: Cross-encoders based on MiniLM take 512 tokens for the query and the passage
-#: TOGETHER. Reserve room for the query and the separator tokens, and truncate the
-#: passage to what is left. Phase 2's children are ~400 tokens, so this normally
-#: does nothing — which is precisely why it must be measured rather than assumed.
+#: TOGETHER. Phase 2's children are ~400 tokens, so truncation normally does
+#: nothing — which is precisely why it must be measured rather than assumed.
 MAX_PAIR_TOKENS = 512
-QUERY_TOKEN_BUDGET = 96
+#: Cap on the query side. A query longer than this is truncated explicitly, because
+#: the passage budget is computed from what the query ACTUALLY uses: reserving a
+#: fixed 96 tokens and then passing a 200-token query pushes the pair over 512 and
+#: the model truncates the far end silently — losing the end of the passage, which
+#: is where a clause's qualifying proviso usually lives.
+MAX_QUERY_TOKENS = 96
+#: [CLS], two [SEP]s, and slack for tokenizer disagreement.
+_PAIR_OVERHEAD = 8
 
 
 class RerankerBase(BaseReranker):
@@ -1021,14 +1072,26 @@ class RerankerBase(BaseReranker):
     def __init__(self, top_k: int | None = None) -> None:
         self.top_k = top_k or settings.RERANK_TOP_K
 
-    def _prepare_passage(self, text: str) -> str:
-        """Fit one passage into the pair budget.
+    def _prepare_query(self, query: str) -> tuple[str, int]:
+        """Cap the query and report how many tokens it actually uses."""
+        tokens = count_tokens(query)
+        if tokens <= MAX_QUERY_TOKENS:
+            return query, tokens
+        logger.warning(
+            "Truncating an oversized query for reranking",
+            extra={"tokens": tokens, "cap": MAX_QUERY_TOKENS},
+        )
+        return truncate_to_tokens(query, MAX_QUERY_TOKENS), MAX_QUERY_TOKENS
 
-        Truncation is silent in the model but not here. A passage cut in half is
-        scored on half its content, and if that happens routinely your reranking is
-        being decided by whatever is in the first paragraph.
+    def _prepare_passage(self, text: str, query_tokens: int) -> str:
+        """Fit one passage into whatever the query left of the pair budget.
+
+        The budget is derived from the query's MEASURED length, not from a fixed
+        reservation. Truncation is silent inside the model but not here: a passage
+        cut short is scored on part of its content, and if that happens routinely
+        your reranking is being decided by whatever sits in the first paragraph.
         """
-        budget = MAX_PAIR_TOKENS - QUERY_TOKEN_BUDGET
+        budget = MAX_PAIR_TOKENS - query_tokens - _PAIR_OVERHEAD
         if count_tokens(text) <= budget:
             return text
         logger.warning("Truncating passage for reranking", extra={"budget": budget})
@@ -1186,10 +1249,11 @@ class CrossEncoderReranker(RerankerBase):
         if not settings.ENABLE_RERANKING:
             return self._passthrough(candidates, top_k)
 
-        passages = [self._prepare_passage(c.chunk.text) for c in candidates]
+        capped_query, query_tokens = self._prepare_query(query)
+        passages = [self._prepare_passage(c.chunk.text, query_tokens) for c in candidates]
 
         try:
-            scores = await asyncio.to_thread(self._score, query, passages)
+            scores = await asyncio.to_thread(self._score, capped_query, passages)
         except Exception as exc:
             logger.warning(
                 "Reranking failed; falling back to retrieval order",
@@ -1397,8 +1461,9 @@ class MMRReranker(RerankerBase):
         if not candidates:
             return []
         if not settings.ENABLE_MMR or len(candidates) <= top_k:
-            # With fewer candidates than slots there is nothing to choose between,
-            # and MMR would only reorder what is all going to the LLM anyway.
+            # With fewer candidates than slots there is nothing to choose between.
+            # NOTE: this short-circuit is why the pipeline must hand MMR a WIDER
+            # pool than `top_k` — see the composition discussion below.
             return candidates[:top_k]
 
         try:
@@ -1407,25 +1472,62 @@ class MMRReranker(RerankerBase):
             logger.warning("MMR embedding failed", extra={"error": type(exc).__name__})
             return candidates[:top_k]
 
-        selected = self._select(query_vector, candidate_vectors, top_k)
+        # Relevance comes from whatever scored the candidates — the cross-encoder if
+        # it ran, the retrieval score otherwise. The first draft recomputed dense
+        # cosine relevance here, which threw away the cross-encoder's judgement
+        # immediately after paying for it. `effective_score` is exactly this
+        # distinction and it already exists on the model.
+        relevance = self._normalised_relevance(candidates)
 
-        chosen = [candidates[i] for i in selected]
-        scores = [
-            cosine_similarity(query_vector, candidate_vectors[i]) for i in selected
-        ]
+        selected = self._select(relevance, candidate_vectors, top_k)
 
         logger.info(
             "MMR selection",
             extra={
                 "candidates": len(candidates),
-                "selected": len(chosen),
+                "selected": len(selected),
                 "lambda": self.lambda_param,
                 # How far down the relevance list MMR reached. A high number means
                 # the top of the list was redundant and diversity did real work.
                 "deepest_index": max(selected) if selected else 0,
+                "dropped_top_ranked": sorted(selected) != list(range(len(selected))),
             },
         )
-        return self._finalise(chosen, scores, top_k)
+
+        # Re-rank from 0 while PRESERVING every score. MMR selects and reorders; it
+        # does not re-score, so overwriting `rerank_score` with a cosine value here
+        # would destroy the evidence the cross-encoder produced (and Phase 7 reads).
+        return [
+            ScoredChunk(
+                chunk=candidates[index].chunk,
+                score=candidates[index].score,
+                rank=new_rank,
+                method=candidates[index].method,
+                rerank_score=candidates[index].rerank_score,
+            )
+            for new_rank, index in enumerate(selected)
+        ]
+
+    @staticmethod
+    def _normalised_relevance(candidates: Sequence[ScoredChunk]) -> list[float]:
+        """Map `effective_score` onto [0, 1] so it can be mixed with cosine.
+
+        The MMR formula subtracts a cosine similarity (bounded [0, 1]) from a
+        relevance term. Cross-encoder scores are unbounded logits — commonly
+        -11 to +8 — so using them raw makes the diversity term irrelevant by
+        several orders of magnitude, and `lambda` stops meaning anything.
+
+        Min-max over the candidate set is deliberately **set-relative**: the same
+        chunk normalises differently depending on what it was retrieved alongside.
+        That is acceptable here and would not be acceptable in a stored score,
+        because this number exists only to choose between these candidates, right
+        now, and is never persisted or compared across queries.
+        """
+        scores = [c.effective_score for c in candidates]
+        low, high = min(scores), max(scores)
+        if high - low < 1e-9:
+            return [1.0] * len(scores)
+        return [(s - low) / (high - low) for s in scores]
 
     async def _embed(
         self, query: str, candidates: Sequence[ScoredChunk]
@@ -1434,6 +1536,10 @@ class MMRReranker(RerankerBase):
 
         The candidates were already embedded during ingestion; we are paying again
         because the store returns payloads, not vectors. ~30ms for 20 passages.
+
+        The query vector is no longer used for relevance — that now comes from
+        `effective_score` — but it is still embedded, cheaply, because it costs one
+        forward pass and keeps the door open for a hybrid relevance term later.
         """
         query_task = self.embedder.embed_query(query)
         docs_task = self.embedder.embed_dense([c.chunk.text for c in candidates])
@@ -1442,13 +1548,11 @@ class MMRReranker(RerankerBase):
 
     def _select(
         self,
-        query_vector: Sequence[float],
+        relevance: Sequence[float],
         candidate_vectors: Sequence[Sequence[float]],
         top_k: int,
     ) -> list[int]:
         """Greedy MMR. Returns candidate indices in selection order."""
-        relevance = [cosine_similarity(query_vector, v) for v in candidate_vectors]
-
         selected: list[int] = [max(range(len(relevance)), key=relevance.__getitem__)]
         remaining = set(range(len(candidate_vectors))) - set(selected)
 
@@ -1473,6 +1577,25 @@ class MMRReranker(RerankerBase):
         return selected
 ```
 
+### Composing MMR with the cross-encoder — the trap
+
+Read `rerank` above and the short-circuit on the third line: `if len(candidates) <= top_k: return
+candidates[:top_k]`. Now consider the obvious pipeline order — cross-encoder produces the top 5, MMR
+then diversifies them.
+
+**MMR receives exactly 5 candidates, is asked for 5, and returns them unchanged.** Enabling it does
+nothing at all. This was the first draft of §11, and it is a perfect example of two individually
+correct components composing into a no-op: the short-circuit is right, the ordering is right, and
+together they cancel out.
+
+The fix is that **the cross-encoder must keep a wider pool than the final answer needs, and MMR makes
+the final cut.** The pipeline therefore reranks to `top_k × MMR_POOL_MULTIPLIER` and lets MMR select
+`top_k` from that. The cost is a slightly larger cross-encoder batch, which is linear and cheap.
+
+The general lesson, worth carrying into Phases 12 and 13: **a stage that both scores and truncates has
+two responsibilities, and the truncation is the one that breaks composition.** When you chain
+selectors, only the last one should be allowed to cut to the final size.
+
 ### The Theory: greedy is not optimal, and that is fine
 
 MMR is greedy: it commits to the best first pick and never reconsiders. The globally optimal
@@ -1496,8 +1619,10 @@ The λ intuition, concretely:
 
 ### Failure Modes
 
-**MMR reorders nothing.** With `len(candidates) <= top_k` it short-circuits by design. Raise
-`RETRIEVAL_TOP_K`.
+**MMR reorders nothing.** With `len(candidates) <= top_k` it short-circuits by design. In the real
+pipeline this is the composition bug described above — check that the cross-encoder is reranking to
+`top_k × MMR_POOL_MULTIPLIER` and not straight to `top_k`. The `dropped_top_ranked` field in the log
+tells you whether MMR actually changed the selection.
 
 **Results are diverse but wrong.** λ too low. At 0.3 the algorithm will happily pick an irrelevant
 passage because it differs from everything selected.
@@ -1562,6 +1687,7 @@ from src.core.interfaces import BaseVectorStore
 from src.core.logging import logger
 from src.core.models import ChunkLevel, ScoredChunk
 from src.core.telemetry import telemetry
+from src.core.utils import truncate_to_tokens
 
 
 class ParentSubstituter:
@@ -1671,9 +1797,32 @@ class ParentSubstituter:
             kept.append(source)
             total += tokens
 
-        # `if kept and ...` above guarantees at least one source survives even if a
-        # single parent exceeds the whole budget. An empty context guarantees a
-        # non-answer; one oversized source at least has a chance.
+        # The one case the loop above cannot handle: a SINGLE source larger than the
+        # entire budget. The first draft kept it whole and claimed a ceiling it did
+        # not enforce. Parents are ~1,600 tokens against a 12,000 budget, so this
+        # means something is badly wrong upstream — a runaway parent, or a budget
+        # configured below one chunk. Truncating one pathological source is the least
+        # bad option available: dropping it returns an empty context, which
+        # guarantees a non-answer, and keeping it whole overruns the model, which
+        # makes the provider silently drop the far end instead of us.
+        if len(kept) == 1 and kept[0].chunk.token_count > self.max_context_tokens:
+            source = kept[0]
+            logger.error(
+                "A single source exceeds the entire context budget; truncating it",
+                extra={
+                    "chunk_id": source.chunk.chunk_id,
+                    "tokens": source.chunk.token_count,
+                    "budget": self.max_context_tokens,
+                },
+            )
+            trimmed = source.chunk.model_copy(
+                update={
+                    "text": truncate_to_tokens(source.chunk.text, self.max_context_tokens),
+                    "token_count": self.max_context_tokens,
+                }
+            )
+            return [source.model_copy(update={"chunk": trimmed})]
+
         return kept
 ```
 
@@ -1795,7 +1944,10 @@ import asyncio
 import time
 from typing import Any
 
+from typing import Any
+
 from config.settings import settings
+from src.core.exceptions import InvalidQueryError
 from src.core.interfaces import (
     BaseEmbeddingProvider,
     BaseLLMProvider,
@@ -1803,7 +1955,7 @@ from src.core.interfaces import (
     BaseVectorStore,
 )
 from src.core.logging import logger
-from src.core.models import RetrievalResult
+from src.core.models import RetrievalResult, ScoredChunk
 from src.core.telemetry import telemetry
 
 from .fusion import reciprocal_rank_fusion
@@ -1843,49 +1995,90 @@ class RetrievalPipeline:
         query: str,
         top_k: int | None = None,
         filters: dict[str, Any] | None = None,
+        expand: bool = True,
     ) -> RetrievalResult:
         """Run the full retrieval cascade.
+
+        Args:
+            expand: Whether to spend LLM calls rephrasing the query. Phase 5's
+                router sets this to False for queries that already contain good
+                search terms — a section reference or a quoted phrase needs no
+                paraphrasing, and expanding it only adds noise and latency.
 
         Raises:
             RetrievalError: every search arm failed. Everything else degrades.
         """
+        if not query or not query.strip():
+            # Validated here, at the boundary, rather than allowed to fail deep
+            # inside embedding. An empty string reaching `embed_query` raises an
+            # EmbeddingError that the arm-failure handler would then report as a
+            # RETRYABLE retrieval outage — telling the caller to try again with the
+            # same invalid input, and pointing the on-call engineer at Qdrant.
+            raise InvalidQueryError("Query cannot be empty", details={"query": repr(query)})
+
+        final_k = top_k if top_k is not None else settings.RERANK_TOP_K
+        if final_k < 1:
+            raise InvalidQueryError("top_k must be at least 1", details={"top_k": final_k})
+
         started = time.perf_counter()
-        final_k = top_k or settings.RERANK_TOP_K
 
         # ── 1. probes ──────────────────────────────────────────────────────
         # Independent LLM calls, issued together. Sequential awaits here would
         # add 400ms to every request for no reason.
-        queries, hypothetical = await asyncio.gather(
-            self.expander.expand(query),
-            self.hyde.generate(query),
-        )
+        #
+        # The flag gates BOTH probes. It is a parameter rather than something the
+        # caller skips itself because skipping happens in two places, and a caller
+        # that remembers one and forgets the other gets a latency profile nobody
+        # can explain.
+        if expand:
+            queries, hypothetical = await asyncio.gather(
+                self.expander.expand(query),
+                self.hyde.generate(query),
+            )
+        else:
+            queries, hypothetical = [query], None
 
-        # ── 2. search ──────────────────────────────────────────────────────
-        outcome = await self.retriever.search_many(queries, filters=filters)
+        # ── 2. search — ALL probes concurrently, HyDE included ──────────────
+        # The first draft awaited `search_many` to completion and only then
+        # embedded and searched the HyDE probe, which contradicted this file's own
+        # data-flow diagram and added a whole round trip of latency.
+        search_tasks = [self.retriever.search_many(queries, filters=filters)]
+        if hypothetical:
+            search_tasks.append(self._search_hyde(hypothetical, filters))
+
+        gathered = await asyncio.gather(*search_tasks)
+
+        outcome = gathered[0]
         result_lists = list(outcome.results)
+        failed_arms = outcome.failed_queries
 
         if hypothetical:
-            # The HyDE text pretends to be a document, so it is embedded with the
-            # passage-side transformation, not the query-side one.
-            dense, sparse = await self.retriever.embed_probe(hypothetical, as_document=True)
-            try:
-                result_lists.append(
-                    await self.retriever.search_vector(dense, sparse, filters=filters)
-                )
-            except Exception as exc:
-                logger.warning("HyDE arm failed", extra={"error": type(exc).__name__})
+            hyde_results = gathered[1]
+            if hyde_results is None:
+                failed_arms += 1
+            else:
+                result_lists.append(hyde_results)
 
         # ── 3. fuse ────────────────────────────────────────────────────────
         fused = reciprocal_rank_fusion(result_lists, top_k=settings.RETRIEVAL_TOP_K)
 
         # ── 4. rerank ──────────────────────────────────────────────────────
-        # On children. A parent would exceed the cross-encoder's 512-token window
-        # and be scored on its first quarter.
-        reranked = await self.reranker.rerank(query, fused, top_k=final_k)
+        # On children — a parent would exceed the cross-encoder's 512-token window.
+        #
+        # Reranking to a WIDER pool when a diversifier follows. Cutting to `final_k`
+        # here would leave MMR with exactly as many candidates as slots, and it
+        # would return them untouched: two correct components composing into a
+        # no-op. Only the LAST selector in a chain may truncate to the final size.
+        rerank_k = (
+            final_k * settings.MMR_POOL_MULTIPLIER if self.diversifier else final_k
+        )
+        reranked = await self._safe_rerank(self.reranker, query, fused, rerank_k, "reranker")
 
         # ── 5. diversify ───────────────────────────────────────────────────
         if self.diversifier is not None:
-            reranked = await self.diversifier.rerank(query, reranked, top_k=final_k)
+            reranked = await self._safe_rerank(
+                self.diversifier, query, reranked, final_k, "diversifier"
+            )
 
         # ── 6. substitute parents ──────────────────────────────────────────
         # Last, because everything above wanted small precise text and generation
@@ -1898,7 +2091,11 @@ class RetrievalPipeline:
             original_query=query,
             expanded_queries=queries[1:],
             chunks=final,
-            total_candidates=outcome.total_candidates,
+            # Counts every arm that contributed, HyDE included. The first draft used
+            # `outcome.total_candidates`, which silently under-reported whenever
+            # HyDE succeeded.
+            total_candidates=sum(len(r) for r in result_lists),
+            failed_arms=failed_arms,
             latency_ms=elapsed_ms,
         )
 
@@ -1906,17 +2103,72 @@ class RetrievalPipeline:
             "Retrieval complete",
             extra={
                 "probes": len(result_lists),
-                "failed_arms": outcome.failed_queries,
-                "candidates": outcome.total_candidates,
+                "failed_arms": failed_arms,
+                "candidates": result.total_candidates,
                 "fused": len(fused),
+                "reranked_to": rerank_k,
                 "returned": result.chunk_count,
                 "latency_ms": round(elapsed_ms, 1),
             },
         )
         return result
 
+    async def _search_hyde(
+        self, hypothetical: str, filters: dict[str, Any] | None
+    ) -> list[ScoredChunk] | None:
+        """Embed and search the HyDE probe. Returns None on failure.
+
+        Returning None rather than an empty list matters: an empty list would be
+        fused as an arm that legitimately found nothing, whereas None is counted in
+        `failed_arms`. Those are different facts about the run.
+        """
+        try:
+            # The HyDE text pretends to be a document, so BOTH its vectors use the
+            # passage-side transformation.
+            dense, sparse = await self.retriever.embed_probe(hypothetical, as_document=True)
+            return await self.retriever.search_vector(dense, sparse, filters=filters)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("HyDE arm failed", extra={"error": type(exc).__name__})
+            return None
+
+    async def _safe_rerank(
+        self,
+        reranker: BaseReranker,
+        query: str,
+        candidates: list[ScoredChunk],
+        top_k: int,
+        label: str,
+    ) -> list[ScoredChunk]:
+        """Run a reranker, degrading to the input order if it raises.
+
+        The concrete rerankers in this phase already handle their own failures. This
+        wrapper exists because the pipeline accepts ANY `BaseReranker`, and the
+        phase-level promise is that reranking always degrades gracefully. A promise
+        that depends on every future implementation remembering to catch its own
+        exceptions is not a promise.
+        """
+        try:
+            return await reranker.rerank(query, candidates, top_k=top_k)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                f"{label} raised; falling back to input order",
+                extra={"error": type(exc).__name__, "candidates": len(candidates)},
+            )
+            return candidates[:top_k]
+
     def warmup(self) -> None:
-        """Load the cross-encoder. Call at startup; the first query should not pay."""
+        """Load the cross-encoder. Call at startup; the first query should not pay.
+
+        Skipped when reranking is disabled — loading a 90 MB ONNX session for a
+        component that will never be called is pure startup cost.
+        """
+        if not settings.ENABLE_RERANKING:
+            logger.info("Reranking disabled; skipping cross-encoder warmup")
+            return
         warm = getattr(self.reranker, "warmup", None)
         if warm is not None:
             warm()
@@ -2012,7 +2264,10 @@ before Phase 6 exists.
 """
 import asyncio
 import sys
+import uuid
 
+from config.settings import settings
+from src.core.exceptions import InvalidQueryError
 from src.core.models import Chunk, ChunkLevel
 from src.core.utils import make_chunk_id, make_doc_id, make_section_id
 from src.embeddings.fastembed_provider import FastEmbedProvider
@@ -2023,7 +2278,9 @@ from src.retrieval.rerankers.cross_encoder import CrossEncoderReranker
 from src.retrieval.rerankers.mmr import MMRReranker
 from src.vectorstores.qdrant_store import QdrantStore
 
-TEMP_COLLECTION = "verify_phase4_tmp"
+#: Unique per run: the teardown deletes this collection unconditionally, and a
+#: fixed name makes a verification script capable of destroying real data.
+TEMP_COLLECTION = f"verify_phase4_{uuid.uuid4().hex[:8]}"
 DOC_ID = make_doc_id("data/contracts/2003/verify4.txt")
 
 #: Five distinct topics, each as a parent with two children. The children are
@@ -2184,15 +2441,104 @@ async def check_mmr(provider: FastEmbedProvider) -> None:
         for n, c in enumerate(ordered)
     ]
 
-    mmr = MMRReranker(provider, lambda_param=0.5)
-    selected = await mmr.rerank("confidentiality obligations", candidates, top_k=2)
+    # ENABLE_MMR defaults to false, and MMRReranker honours it — so without this
+    # the call is a no-op and the assertion below fails for the wrong reason. A test
+    # must not depend on the ambient configuration it is testing.
+    original = settings.ENABLE_MMR
+    settings.ENABLE_MMR = True
+    try:
+        mmr = MMRReranker(provider, lambda_param=0.5)
+        selected = await mmr.rerank("confidentiality obligations", candidates, top_k=2)
+    finally:
+        settings.ENABLE_MMR = original
 
     titles = [s.chunk.section_title for s in selected]
     assert len(set(titles)) == 2, (
         f"MMR kept two chunks from the same section: {titles}. With lambda=0.5 the "
         "second slot should have gone to a different topic."
     )
-    print(f"✓ mmr: second slot went to a different topic ({titles})")
+    # MMR selects and reorders; it must not re-score. The cross-encoder's evidence
+    # has to survive it.
+    assert all(s.rerank_score is None for s in selected), (
+        "MMR invented rerank_scores; it should preserve whatever it was given"
+    )
+    assert [s.rank for s in selected] == [0, 1], "MMR must re-rank from 0"
+    print(f"✓ mmr: second slot went to a different topic ({titles}), scores preserved")
+
+
+async def check_mmr_composition(provider: FastEmbedProvider, store: QdrantStore) -> None:
+    """MMR must not be a no-op inside the real pipeline.
+
+    This is the check that would have caught the composition bug: the cross-encoder
+    truncating to `final_k` left MMR with exactly as many candidates as slots, so
+    enabling it did nothing. A direct unit test of MMR passes happily while the
+    pipeline it lives in ignores it.
+    """
+    original = settings.ENABLE_MMR
+    settings.ENABLE_MMR = True
+    try:
+        pipeline = RetrievalPipeline(
+            embedder=provider, store=store, llm=None,
+            diversifier=MMRReranker(provider, lambda_param=0.5),
+        )
+        pipeline.warmup()
+        result = await pipeline.retrieve("obligations of the parties", top_k=2)
+    finally:
+        settings.ENABLE_MMR = original
+
+    assert result.chunk_count == 2, f"expected 2 sources, got {result.chunk_count}"
+    # The cross-encoder must have been handed a wider pool than the final answer.
+    expected_pool = 2 * settings.MMR_POOL_MULTIPLIER
+    assert expected_pool > 2, "MMR_POOL_MULTIPLIER must be > 1 for MMR to do anything"
+    titles = [c.chunk.section_title for c in result.chunks]
+    assert len(set(titles)) == 2, (
+        f"the pipeline returned two sources from the same section ({titles}) — MMR "
+        "is probably a no-op because the reranker truncated to top_k first"
+    )
+    print(f"✓ mmr composition: pipeline reranked to {expected_pool} then diversified to 2")
+
+
+async def check_input_validation(provider: FastEmbedProvider, store: QdrantStore) -> None:
+    """A malformed request must not look like a vector-store outage."""
+    pipeline = RetrievalPipeline(embedder=provider, store=store, llm=None)
+
+    for bad_query in ("", "   "):
+        try:
+            await pipeline.retrieve(bad_query)
+        except InvalidQueryError:
+            pass
+        else:
+            raise AssertionError(f"a blank query ({bad_query!r}) must raise InvalidQueryError")
+
+    try:
+        await pipeline.retrieve("valid question", top_k=0)
+    except InvalidQueryError:
+        pass
+    else:
+        raise AssertionError("top_k=0 must raise rather than silently becoming the default")
+
+    print("✓ validation: blank queries and non-positive top_k rejected at the boundary")
+
+
+async def check_degraded_diagnostics(provider: FastEmbedProvider, store: QdrantStore) -> None:
+    """A partial search failure must be visible in the RESULT, not only in logs."""
+    from src.retrieval.hybrid import HybridRetriever
+
+    retriever = HybridRetriever(provider, store)
+
+    # One good query, one that will fail: an unsupported filter field raises inside
+    # the store, which is exactly the per-arm failure this must tolerate.
+    good = await retriever.search_many(["termination notice"])
+    assert good.failed_queries == 0, "a valid search should not report failures"
+    assert good.total_candidates > 0
+
+    pipeline = RetrievalPipeline(embedder=provider, store=store, llm=None)
+    result = await pipeline.retrieve("termination notice")
+    assert hasattr(result, "failed_arms"), "RetrievalResult must carry failed_arms"
+    assert result.failed_arms == 0
+    assert result.total_candidates > 0, "candidate count must be recorded"
+
+    print("✓ diagnostics: failed_arms and total_candidates present on the result")
 
 
 async def check_parents(store: QdrantStore) -> None:
@@ -2294,7 +2640,10 @@ async def main() -> int:
 
         await check_reranker(provider)
         await check_mmr(provider)
+        await check_mmr_composition(provider, store)
         await check_parents(store)
+        await check_input_validation(provider, store)
+        await check_degraded_diagnostics(provider, store)
         await check_pipeline(provider, store)
     except AssertionError as exc:
         print(f"\n✗ FAILED: {exc}")
@@ -2305,6 +2654,7 @@ async def main() -> int:
             print(f"  (cleaned up {TEMP_COLLECTION})")
         finally:
             await store.close()
+            await provider.close()
 
     print("\nPhase 4 verified.")
     return 0
@@ -2332,6 +2682,19 @@ definition. Once Phase 6 supplies an LLM, watch this number — §6 explains how
 **After a real ingestion run,** try the three vocabulary-gap queries from §3 by hand. Those are the
 queries this entire phase exists to answer, and they are the ones to check before believing any
 benchmark.
+
+### What this script still does not cover
+
+Stated plainly rather than implied, because an unlisted gap reads as coverage:
+
+- **Query expansion and HyDE with a live LLM.** Both are exercised only in their disabled state. Phase
+  5's `ScriptedLLM` is the tool for this — once you have it, inject it here and assert that
+  `expanded_queries` is populated and that a HyDE arm appears in `total_candidates`.
+- **Cancellation.** `search_many` re-raises `CancelledError` rather than counting it as a failed arm,
+  and that path is untested. Phase 10's async test fixtures are the right place.
+- **A genuinely failing search arm.** `check_degraded_diagnostics` asserts the *field* exists and reads
+  zero; it does not force an arm to fail. Doing that properly needs a store stub, which belongs in
+  Phase 10 alongside the one Phase 3's `check_transaction` already uses.
 
 ---
 
