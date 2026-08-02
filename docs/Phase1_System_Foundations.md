@@ -1474,6 +1474,11 @@ class RAGAnswer(BaseModel):
     #: Non-zero means the answer's provenance is partly fabricated, which is worth
     #: surfacing even though Phase 6 owns strict validation.
     invalid_citations: int = Field(default=0, ge=0)
+    #: Non-fatal findings about this answer, in plain language — uncited figures, a
+    #: missing citation, a degraded retrieval arm. Phase 8 renders these next to the
+    #: answer and Phase 7 counts them. They live here rather than in logs because a
+    #: warning nobody can join to the answer it describes is not a warning.
+    warnings: list[str] = Field(default_factory=list)
 ```
 
 ### The Theory: composition versus inheritance, and why `ScoredChunk` is built the way it is
@@ -1819,6 +1824,16 @@ class BaseLLMProvider(ABC):
         types as returning `AsyncIterator`. Writing `async def stream(...)` in the ABC
         would demand `await provider.stream(...)` before iterating, which is wrong.
         """
+
+    async def close(self) -> None:
+        """Release the connection pool. Default is a no-op.
+
+        Same lifecycle pattern as `BaseEmbeddingProvider.close()`: every LLM
+        provider is network-backed, so in practice all of them override this — but
+        it is non-abstract so that a test double or a local provider need not.
+        Callers close unconditionally and never branch on provider type.
+        """
+        return None
 
 
 class BaseCache(ABC):

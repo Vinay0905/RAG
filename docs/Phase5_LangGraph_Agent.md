@@ -975,6 +975,20 @@ def format_context(sources: list[ScoredChunk]) -> tuple[str, dict[int, ScoredChu
     end up pointing at the wrong document — a failure that looks like working
     provenance.
     """
+    # Retrieved contract text is UNTRUSTED INPUT — a counterparty drafted it, and a
+    # clause can contain instructions aimed at whatever summarises the document.
+    # This is the trust boundary: the last point before document text becomes prompt
+    # text. Phase 6 owns the guardrail; this is the only place that must remember to
+    # apply it.
+    from src.guardrails.prompt_injection import sanitise_sources
+
+    sources, neutralised = sanitise_sources(list(sources))
+    if neutralised:
+        logger.warning(
+            "Neutralised instruction-like language in retrieved sources",
+            extra={"chunks": neutralised},
+        )
+
     blocks: list[str] = []
     mapping: dict[int, ScoredChunk] = {}
 
