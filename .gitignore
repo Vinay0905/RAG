@@ -1,2 +1,29 @@
+# Secrets — never commit
 .env
+.env.*
+!.env.example
+
+# Corpus and derived artefacts — large, regenerable, must stay out of git
+data/
 dataset/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Editors and OS
+.DS_Store
+.idea/
+*.swp

@@ -1,22 +1,44 @@
-version: '3.8'
-
 services:
   qdrant:
-    image: qdrant/qdrant:latest
-    container_name: cuad_qdrant
+    # Pin this. Replace with the exact tag you first run successfully, and record it
+    # here — check https://hub.docker.com/r/qdrant/qdrant/tags for available versions.
+    # Must be >= v1.10 for the query_points Universal API used in Phases 3 and 4.
+    image: qdrant/qdrant:v1.12.4
+    container_name: legalrag_qdrant
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      # Bound to localhost only. Qdrant has no authentication by default, so
+      # exposing 0.0.0.0 would publish an unauthenticated database to your network.
+      - "127.0.0.1:6333:6333"     # REST API — this is what the Python client uses
+      - "127.0.0.1:6334:6334"     # gRPC API — faster for bulk upserts, optional
     volumes:
       - qdrant_storage:/qdrant/storage
-    restart: always
+    environment:
+      QDRANT__SERVICE__MAX_REQUEST_SIZE_MB: 64      # default 32 MB; our upsert batches exceed it
+      QDRANT__LOG_LEVEL: INFO
+    # No healthcheck: the image is distroless and cannot make an HTTP request to
+    # itself. Readiness is verified by the application in Phase 8's lifespan hook.
+    restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
-    container_name: cuad_redis
+    image: redis:7.4-alpine
+    container_name: legalrag_redis
     ports:
-      - "6379:6379"
-    restart: always
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_storage:/data
+    # Cache eviction: when memory fills, drop least-recently-used keys instead of erroring.
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
 
 volumes:
   qdrant_storage:
+  redis_storage:
